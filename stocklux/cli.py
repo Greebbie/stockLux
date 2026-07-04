@@ -43,6 +43,7 @@ def add(
     name: str = typer.Option("", help="company name"),
     note: str = typer.Option("", help="one-line note"),
     holding: bool = typer.Option(False, "--holding", help="mark as a position the user actually owns"),
+    benchmark: str = typer.Option("", help="relative-strength benchmark (e.g. SMH, XLU); default SPY"),
 ) -> None:
     """Add a stock to the watchlist."""
     data_dir = _data_dir()
@@ -53,7 +54,7 @@ def add(
     try:
         wl = store.add_stock(store.load_watchlist(data_dir), ticker=ticker.upper(),
                              thesis=thesis, layer=layer, name=name, note=note,
-                             holding=holding)
+                             holding=holding, benchmark=benchmark.upper())
     except ValueError as e:
         typer.echo(str(e))
         raise typer.Exit(1)

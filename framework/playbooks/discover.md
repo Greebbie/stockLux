@@ -18,6 +18,11 @@ report in English.
 3. **Quick-screen each candidate** (use quotes.json where available, otherwise
    look up online and cite the source):
    - Thesis-relevant revenue share (now → direction in 12 months)
+   - Estimate-revision momentum where available (quotes.json `revisions`, or
+     the same data looked up online): a candidate whose forward EPS is being
+     revised up while its price lags the layer is the classic discover hit;
+     persistent downward revisions disqualify a "cheap" classification —
+     cheap-and-deteriorating is a value trap, not an opportunity
    - Scenario elasticity: where this name's EPS/order elasticity ranks within
      its layer once the thesis plays out
    - Rough good-buy estimate: consensus fwd EPS × scenario growth × a

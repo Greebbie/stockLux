@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .flows import fetch_flows
+from .history import append_history
 from .quotes import fetch_quotes
 from .store import load_watchlist
 
@@ -26,16 +27,23 @@ def _write_json(path: Path, data: dict) -> None:
 
 def refresh_data(data_dir: Path) -> dict:
     data_dir = Path(data_dir)
-    tickers = [s["ticker"] for s in load_watchlist(data_dir)["stocks"]]
+    stocks = load_watchlist(data_dir)["stocks"]
+    tickers = [s["ticker"] for s in stocks]
+    benchmarks = {s["ticker"]: s["benchmark"] for s in stocks if s.get("benchmark")}
     quotes = fetch_quotes(tickers, load_json(data_dir / "quotes.json"))
-    flows = fetch_flows(tickers, load_json(data_dir / "flows.json"))
+    flows = fetch_flows(tickers, load_json(data_dir / "flows.json"), benchmarks)
     data_dir.mkdir(parents=True, exist_ok=True)
     _write_json(data_dir / "quotes.json", quotes)
     _write_json(data_dir / "flows.json", flows)
+    append_history(data_dir, quotes, flows)
     return quotes
 
 
 def quotes_stale(data_dir: Path, hours: float = 12) -> bool:
+    # 12h is the CLI's auto-refresh threshold (stocklux ui). The methodology's
+    # 24h rule is a different gate: it is where an *agent* must stop and ask
+    # the user to refresh. Intentionally stricter here — cheap to refresh
+    # early, expensive to analyze on stale data.
     q = load_json(Path(data_dir) / "quotes.json")
     if not q or not q.get("fetched_at"):
         return True

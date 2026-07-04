@@ -192,6 +192,99 @@ def test_validate_memo_holding_gates_actions():
     assert store.validate_memo(meta) == []  # no holding context → no gate
 
 
+def _v2_meta(**over):
+    """A memo dated on/after POLICY_V2_DATE, fully compliant with the
+    2026-07-05 contract (probabilities, entry plan, RR 2.2 >= 2)."""
+    meta, _ = store.parse_frontmatter(VALID_MEMO)
+    v2 = {**meta, "date": "2026-07-05", "price_at_analysis": 975, "mode": "full",
+          "price_targets": {"bear": 600, "base": 1800, "bull": 2400,
+                            "p_bear": 0.2, "p_base": 0.55, "p_bull": 0.25,
+                            "horizon": "12mo"},
+          "entry_plan": {"tranches": [975, 900], "invalidation": 700}}
+    return {**v2, **over}
+
+
+def test_v2_compliant_memo_passes():
+    assert store.validate_memo(_v2_meta()) == []
+
+
+def test_v2_requires_tier_probabilities():
+    pt = {"bear": 600, "base": 1800, "bull": 2400, "horizon": "12mo"}
+    errors = store.validate_memo(_v2_meta(price_targets=pt))
+    assert any("p_bear" in e for e in errors)
+
+
+def test_v2_probabilities_must_sum_to_one():
+    meta = _v2_meta()
+    pt = {**meta["price_targets"], "p_base": 0.4}  # sum 0.85
+    errors = store.validate_memo({**meta, "price_targets": pt})
+    assert any("sum to 1.0" in e for e in errors)
+
+
+def test_v2_enter_requires_entry_plan():
+    errors = store.validate_memo(_v2_meta(entry_plan=None))
+    assert any("entry_plan" in e for e in errors)
+    # but a non-entry verdict doesn't need one
+    ok = store.validate_memo(_v2_meta(action="watch_only", entry_plan=None))
+    assert ok == []
+
+
+def test_entry_plan_shape_validated_whenever_present():
+    errors = store.validate_memo(
+        _v2_meta(entry_plan={"tranches": [1, 2, 3, 4], "invalidation": "low"}))
+    joined = "\n".join(errors)
+    assert "tranches" in joined
+    assert "invalidation" in joined
+
+
+def test_v2_risk_reward_gate_blocks_thin_enter():
+    meta = _v2_meta()
+    pt = {**meta["price_targets"], "base": 1200}  # RR (1200-975)/(975-600) = 0.6
+    errors = store.validate_memo({**meta, "price_targets": pt})
+    assert any("risk/reward" in e for e in errors)
+    # the same targets under watch_only are fine — the gate is enter-only
+    ok = store.validate_memo(
+        {**meta, "price_targets": pt, "action": "watch_only", "entry_plan": None})
+    assert ok == []
+
+
+def test_pre_policy_memo_is_grandfathered():
+    """Dated before 2026-07-05: no probabilities, no entry plan, no RR gate."""
+    meta, _ = store.parse_frontmatter(VALID_MEMO)  # date 2026-07-04, action enter
+    old = {**meta, "price_targets": {"bear": 900, "base": 1000, "bull": 1100,
+                                     "horizon": "12mo"}}
+    assert store.validate_memo(old) == []
+
+
+def test_v2_requires_mode():
+    meta = _v2_meta()
+    del meta["mode"]
+    assert any("mode" in e for e in store.validate_memo(meta))
+    assert any("mode" in e for e in store.validate_memo(_v2_meta(mode="lazy")))
+
+
+def test_v2_requires_all_eight_signals():
+    meta = _v2_meta()
+    partial = dict(meta["signals"])
+    del partial["competition"], partial["macro"]
+    errors = store.validate_memo({**meta, "signals": partial})
+    assert any("competition" in e and "macro" in e for e in errors)
+    # pre-policy memos are not retro-flagged
+    old, _ = store.parse_frontmatter(VALID_MEMO)
+    old_partial = {**old, "signals": partial}
+    assert not any("eight" in e for e in store.validate_memo(old_partial))
+
+
+def test_add_stock_benchmark():
+    wl = store.add_stock({"stocks": []}, ticker="MU", thesis="x", benchmark="SMH")
+    assert wl["stocks"][0]["benchmark"] == "SMH"
+    # omitted → field absent (defaults to SPY at fetch time)
+    wl2 = store.add_stock({"stocks": []}, ticker="CEG", thesis="x")
+    assert "benchmark" not in wl2["stocks"][0]
+    with pytest.raises(ValueError):
+        store.add_stock({"stocks": []}, ticker="ON", thesis="x", benchmark="bad!")
+
+
 def test_validate_memo_rejects_boolean_ticker():
     """YAML parses bare ON/NO/YES as booleans — must be caught, not silently accepted."""
     meta, _ = store.parse_frontmatter(VALID_MEMO.replace('ticker: "ON"', "ticker: ON"))

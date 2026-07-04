@@ -20,7 +20,7 @@ def _fake_quotes(tickers, prev=None):
                        for t in tickers}}
 
 
-def _fake_flows(tickers, prev=None):
+def _fake_flows(tickers, prev=None, benchmarks=None):
     return {"fetched_at": "2026-07-04T00:00:00+00:00",
             "flows": {t: {"short_pct_float": 0.02, "stale": False} for t in tickers}}
 
@@ -46,6 +46,9 @@ def test_refresh_writes_files(tmp_path, monkeypatch):
     assert q["quotes"]["ON"]["price"] == 100.0
     assert (d / "flows.json").exists()
     assert "ON" in result.output
+    # refresh also appends to the snapshot log
+    hist = (d / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(hist[0])["ticker"] == "ON"
 
 
 def test_refresh_empty_watchlist_exits_1(tmp_path, monkeypatch):

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -26,6 +26,7 @@ SIGNAL_KEYS = [
 SIGNAL_VALUES = ["favorable", "neutral", "unfavorable", "no_signal"]
 THESIS_STATUS = ["intact", "weakening", "damaged", "dead"]
 CONFIDENCE = ["high", "medium", "low"]
+ANALYSIS_MODES = ["full", "incremental"]
 
 
 def ensure_dirs(data_dir: Path) -> None:
@@ -49,9 +50,12 @@ def save_watchlist(data_dir: Path, watchlist: dict) -> None:
 def add_stock(
     watchlist: dict, *, ticker: str, thesis: str,
     layer: str = "", name: str = "", note: str = "", holding: bool = False,
+    benchmark: str = "",
 ) -> dict:
     if not TICKER_RE.match(ticker):
         raise ValueError(f"invalid ticker: {ticker} (uppercase, e.g. MU, BRK.B)")
+    if benchmark and not TICKER_RE.match(benchmark):
+        raise ValueError(f"invalid benchmark ticker: {benchmark}")
     if any(s["ticker"] == ticker for s in watchlist["stocks"]):
         raise ValueError(f"{ticker} is already on the watchlist")
     entry = {
@@ -59,6 +63,8 @@ def add_stock(
         "added": datetime.now(timezone.utc).date().isoformat(), "note": note,
         "holding": holding,
     }
+    if benchmark:
+        entry["benchmark"] = benchmark
     return {"stocks": watchlist["stocks"] + [entry]}
 
 
@@ -82,6 +88,25 @@ MEMO_REQUIRED = [
     "price_at_analysis", "verdict", "thesis_health", "review_trigger",
 ]
 _VERDICTS = ["below_range", "in_range", "above_range"]
+
+# Memos dated on/after this must carry tier probabilities, an entry plan for
+# enter/wait_for_pullback, and pass the risk/reward >= 2 gate on `enter`
+# (methodology "Grandfathering"). Older memos are validated to the old contract.
+POLICY_V2_DATE = date(2026, 7, 5)
+MIN_RISK_REWARD = 2.0
+_PROB_KEYS = ("p_bear", "p_base", "p_bull")
+
+
+def _memo_date(meta: dict) -> date | None:
+    v = meta.get("date")
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        return date.fromisoformat(str(v))
+    except ValueError:
+        return None
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -130,11 +155,63 @@ def validate_memo(meta: dict, *, holding: bool | None = None) -> list[str]:
             for k in ("bear", "base", "bull"):
                 if not isinstance(pt.get(k), (int, float)):
                     errors.append(f"price_targets.{k} must be a number")
-    for k, v in (meta.get("signals") or {}).items():
+
+    memo_dt = _memo_date(meta)
+    v2 = memo_dt is not None and memo_dt >= POLICY_V2_DATE
+
+    if v2 and isinstance(pt, dict):
+        probs = [pt.get(k) for k in _PROB_KEYS]
+        if not all(isinstance(p, (int, float)) for p in probs):
+            errors.append(
+                "price_targets must carry p_bear/p_base/p_bull "
+                "(required for memos dated on/after 2026-07-05)")
+        elif not all(0 <= p <= 1 for p in probs) or abs(sum(probs) - 1.0) > 0.01:
+            errors.append(
+                f"tier probabilities must each be in [0,1] and sum to 1.0 "
+                f"(got {sum(probs):.2f})")
+
+    ep = meta.get("entry_plan")
+    if v2 and action in NON_HOLDING_ONLY_ACTIONS and not isinstance(ep, dict):
+        errors.append(
+            f"action '{action}' requires entry_plan {{tranches, invalidation}} "
+            f"(required for memos dated on/after 2026-07-05)")
+    if isinstance(ep, dict):
+        tranches = ep.get("tranches")
+        if not (isinstance(tranches, list) and 1 <= len(tranches) <= 3
+                and all(isinstance(x, (int, float)) for x in tranches)):
+            errors.append("entry_plan.tranches must be a list of 1-3 numbers")
+        if not isinstance(ep.get("invalidation"), (int, float)):
+            errors.append("entry_plan.invalidation must be a number")
+
+    if v2 and action == "enter" and isinstance(pt, dict):
+        base, bear = pt.get("base"), pt.get("bear")
+        px = meta.get("price_at_analysis")
+        if (all(isinstance(x, (int, float)) for x in (base, bear, px))
+                and px > bear):
+            rr = (base - px) / (px - bear)
+            if rr < MIN_RISK_REWARD:
+                errors.append(
+                    f"risk/reward {rr:.1f} < {MIN_RISK_REWARD:.0f} — 'enter' fails "
+                    f"the precedence-rule-6 gate (base {base} / bear {bear} / "
+                    f"price {px})")
+
+    signals = meta.get("signals") or {}
+    for k, v in signals.items():
         if k not in SIGNAL_KEYS:
             errors.append(f"unknown signal dimension: {k}")
         elif v not in SIGNAL_VALUES:
             errors.append(f"invalid signal value: {k}={v}")
+    if v2:
+        missing = [k for k in SIGNAL_KEYS if k not in signals]
+        if missing:
+            errors.append(
+                f"all eight dimensions must be ruled (missing: {', '.join(missing)}) "
+                f"— a skipped dimension is a skipped analysis")
+        mode = meta.get("mode")
+        if mode not in ANALYSIS_MODES:
+            errors.append(
+                "mode must be 'full' or 'incremental' "
+                "(required for memos dated on/after 2026-07-05)")
     return errors
 
 

@@ -25,6 +25,7 @@ function esc(s) {
 }
 
 const fmt = (v, d = 1) => (v == null ? "—" : Number(v).toFixed(d));
+const sgn = (v, d = 1) => (v == null ? "—" : (v > 0 ? "+" : "") + Number(v).toFixed(d));
 const pretty = (s) => String(s ?? "—").replace(/_/g, " ");
 
 function analyzeCmd(ticker) {
@@ -77,9 +78,14 @@ function verdictCard(meta, currentPrice) {
   const pt = meta.price_targets || {};
   const br = meta.buy_range;
   const range = Array.isArray(br) && br.length === 2 ? `${br[0]}–${br[1]}` : "—";
+  const prob = (p) => (p == null ? "" : ` <span class="muted">${Math.round(p * 100)}%</span>`);
   const targets = pt.base != null
-    ? `bear ${fmt(pt.bear, 0)} / <b>base ${fmt(pt.base, 0)}</b> / bull ${fmt(pt.bull, 0)}
+    ? `bear ${fmt(pt.bear, 0)}${prob(pt.p_bear)} / <b>base ${fmt(pt.base, 0)}</b>${prob(pt.p_base)} / bull ${fmt(pt.bull, 0)}${prob(pt.p_bull)}
        <span class="muted">(${esc(pt.horizon || "12mo")})</span>`
+    : "—";
+  const ep = meta.entry_plan;
+  const entryPlan = ep && Array.isArray(ep.tranches)
+    ? `tranches ${ep.tranches.map((t) => fmt(t, 0)).join(" / ")} · <b>invalidation ${fmt(ep.invalidation, 0)}</b>`
     : "—";
   const risks = Array.isArray(meta.top_risks) && meta.top_risks.length
     ? esc(meta.top_risks.join(" · ")) : "—";
@@ -88,6 +94,7 @@ function verdictCard(meta, currentPrice) {
     ["Price now vs at analysis", `${fmt(currentPrice, 2)} <span class="muted">/ ${fmt(meta.price_at_analysis, 2)}</span>`],
     ["Good-buy range", range],
     ["Price targets", targets],
+    ["Entry plan", entryPlan],
     ["Thesis health", esc(meta.thesis_health || "—")],
     ["Multiple basis", esc(meta.multiple_basis || "—")],
     ["Top risks", risks],
@@ -140,14 +147,22 @@ async function showStock(ticker) {
   state.ticker = ticker;
   const d = await api(`/api/stocks/${ticker}`);
   const q = d.quote || {}, f = d.flows || {}, sig = (f.signals || {});
+  const tr = f.trend || {}, rev = q.revisions || {}, an = q.analyst || {};
   let html = `<h2>${ticker}</h2><div class="panel">
     Price <b>${fmt(q.price, 2)}</b> · ttm P/E ${fmt(q.ttm_pe)} · fwd P/E ${fmt(q.fwd_pe)}
     · 52w ${fmt(q.low_52w)}–${fmt(q.high_52w)}
+    · next earnings <b>${esc(q.next_earnings || "—")}</b>
     <div class="muted">Flows: short ${f.short_pct_float != null ? (f.short_pct_float * 100).toFixed(1) + "% of float" : "—"}
     · institutions ${f.inst_pct != null ? (f.inst_pct * 100).toFixed(0) + "%" : "—"}
     · put/call OI ${fmt(f.put_call_oi_ratio, 2)}
     · volume ${sig.accumulation_hint ? "possible accumulation (flat price + net buying)" : "no accumulation pattern"}
-    (proxy signals; 13F lags ~45 days)</div></div>`;
+    (proxy signals; 13F lags ~45 days)</div>
+    <div class="muted">Trend: 50dma ${sgn(tr.dist_50dma_pct)}% · 200dma ${sgn(tr.dist_200dma_pct)}%
+    · RSI-14 ${fmt(tr.rsi_14, 0)} · ATR ${fmt(tr.atr_pct_14)}%
+    · 3m rel strength ${sgn(tr.rel_strength_3m)}pp vs ${esc(tr.benchmark || "SPY")}</div>
+    <div class="muted">Estimates: fwd EPS 90d ${sgn(rev.fwd_eps_change_90d_pct)}%
+    · revisions ↑${rev.up_last_30d ?? "—"} / ↓${rev.down_last_30d ?? "—"} (30d)
+    · analyst PT ${fmt(an.pt_low, 0)}–${fmt(an.pt_high, 0)} (mean ${fmt(an.pt_mean, 0)}, n=${an.n_analysts ?? "—"}, rec ${fmt(an.rec_mean, 1)})</div></div>`;
   html += cmdBlock(analyzeCmd(ticker));
   html += cmdBlock(`stocklux export ${ticker} --pdf`);
   if (d.memos.length) {
@@ -214,6 +229,7 @@ async function renderManage() {
     <div class="form-row">
       <input id="add-name" placeholder="Company name (optional)">
       <input id="add-note" placeholder="One-line note (optional)">
+      <input id="add-benchmark" placeholder="RS benchmark, e.g. SMH (default SPY)">
     </div>
     <button class="primary" onclick="addStock()">Add</button></div>
     <h2>Current watchlist</h2><table><tr><th>Ticker</th><th>Thesis</th><th>Layer</th><th></th></tr>`;
@@ -231,7 +247,8 @@ async function addStock() {
     await api("/api/watchlist", { method: "POST", body: JSON.stringify({
       ticker: $("#add-ticker").value.trim(), thesis: $("#add-thesis").value,
       layer: $("#add-layer").value.trim(), name: $("#add-name").value.trim(),
-      note: $("#add-note").value.trim() }) });
+      note: $("#add-note").value.trim(),
+      benchmark: $("#add-benchmark").value.trim() }) });
     toast("added");
     renderManage();
   } catch (e) { toast(`failed: ${e.message}`); }

@@ -34,9 +34,14 @@ stocklux refresh                           # fetch quotes + flow data
 stocklux ui                                # dashboard → http://127.0.0.1:8321
 ```
 
+On Windows, double-click **`StockLux.bat`** in the repo root instead: it opens
+the dashboard if the server is already running, or starts it (closing that
+console window stops the server).
+
 Run analyses from any agent CLI:
 
 ```
+claude "/lux-run"                      # one command: refresh → audit → scan → analyze → retrospect
 claude "/lux-analyze ON"               # full 8-dimension analysis → structured memo
 claude "/lux-audit-thesis ev-adoption" # stress-test a thesis against consensus
 claude "/lux-discover ev-adoption"     # screen the supply chain for new candidates

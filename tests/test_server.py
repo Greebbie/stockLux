@@ -129,6 +129,75 @@ def test_static_assets_served(data_dir):
     assert c.get("/style.css").status_code == 200
 
 
+def _write_high_confidence_memo(data_dir, memo_date="2026-06-20"):
+    memo = (data_dir / "analyses" / "ON" / "2026-06-01.md").read_text(encoding="utf-8")
+    memo = memo.replace("confidence: medium", "confidence: high")
+    memo = memo.replace("date: 2026-06-01", f"date: {memo_date}")
+    (data_dir / "analyses" / "ON" / f"{memo_date}.md").write_text(memo, encoding="utf-8")
+
+
+def _set_thesis_audited(data_dir, last_audited):
+    p = data_dir / "theses" / "ev-adoption.md"
+    text = p.read_text(encoding="utf-8").replace(
+        "created: 2026-07-01", f"created: 2026-07-01\nlast_audited: {last_audited}")
+    p.write_text(text, encoding="utf-8")
+
+
+def test_high_confidence_on_unaudited_thesis_flagged(data_dir):
+    _write_high_confidence_memo(data_dir)  # ev-adoption has no last_audited
+    ov = build_overview(data_dir)
+    on = next(r for r in ov["rows"] if r["ticker"] == "ON")
+    assert any("never-audited" in e for e in on["memo_errors"])
+
+
+def test_high_confidence_on_fresh_audit_passes(data_dir):
+    _set_thesis_audited(data_dir, "2026-06-01")  # 19 days before the memo
+    _write_high_confidence_memo(data_dir)
+    ov = build_overview(data_dir)
+    on = next(r for r in ov["rows"] if r["ticker"] == "ON")
+    assert not any("audit" in e for e in on["memo_errors"])
+
+
+def test_high_confidence_on_stale_audit_flagged(data_dir):
+    _set_thesis_audited(data_dir, "2026-01-01")  # 171 days before the memo
+    _write_high_confidence_memo(data_dir)
+    ov = build_overview(data_dir)
+    on = next(r for r in ov["rows"] if r["ticker"] == "ON")
+    assert any("audit is" in e and "days older" in e for e in on["memo_errors"])
+
+
+def test_medium_confidence_on_unaudited_thesis_not_flagged(data_dir):
+    # the fixture memo is confidence: medium on a never-audited thesis — the
+    # cap is already respected, so no warning
+    ov = build_overview(data_dir)
+    on = next(r for r in ov["rows"] if r["ticker"] == "ON")
+    assert not any("audit" in e for e in on["memo_errors"])
+
+
+def _write_memo_with_mode(data_dir, memo_date, mode):
+    memo = (data_dir / "analyses" / "ON" / "2026-06-01.md").read_text(encoding="utf-8")
+    memo = memo.replace("date: 2026-06-01", f"date: {memo_date}")
+    memo = memo.replace("confidence: medium", f"confidence: medium\nmode: {mode}")
+    (data_dir / "analyses" / "ON" / f"{memo_date}.md").write_text(memo, encoding="utf-8")
+
+
+def test_three_consecutive_incrementals_flagged(data_dir):
+    for i, mode in enumerate(["incremental", "incremental", "incremental"]):
+        _write_memo_with_mode(data_dir, f"2026-06-1{i + 1}", mode)
+    ov = build_overview(data_dir)
+    on = next(r for r in ov["rows"] if r["ticker"] == "ON")
+    assert any("full rewrite" in e for e in on["memo_errors"])
+
+
+def test_two_incrementals_after_full_not_flagged(data_dir):
+    for memo_date, mode in [("2026-06-11", "full"), ("2026-06-12", "incremental"),
+                            ("2026-06-13", "incremental")]:
+        _write_memo_with_mode(data_dir, memo_date, mode)
+    ov = build_overview(data_dir)
+    on = next(r for r in ov["rows"] if r["ticker"] == "ON")
+    assert not any("full rewrite" in e for e in on["memo_errors"])
+
+
 def test_overview_includes_price_targets(data_dir):
     memo = (data_dir / "analyses" / "ON" / "2026-06-01.md").read_text(encoding="utf-8")
     memo = memo.replace("buy_range: [38, 55]",

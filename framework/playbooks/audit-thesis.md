@@ -5,6 +5,11 @@ user's subjective judgment — your job is not to agree with it, it's to hold it
 up to the light. Read `framework/methodology.md` first. Write the audit in
 English.
 
+**Cadence**: audits expire after 90 days (methodology: "The thesis itself is
+under test") — a thesis with `last_audited` null or older than that caps
+every memo built on it at medium confidence, so run this playbook at least
+quarterly per active thesis, and immediately when the scan flags it.
+
 ## Steps
 
 ### 0. Answer open rebuttals first

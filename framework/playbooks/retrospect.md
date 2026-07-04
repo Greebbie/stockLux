@@ -14,8 +14,9 @@ English.
 
 ## Preconditions
 
-1. Read `data/quotes.json`; if `fetched_at` is more than 24 hours old, stop
-   and prompt the user to run `stocklux refresh`.
+1. Read `data/quotes.json`; if `fetched_at` is more than 24 hours old, run
+   `stocklux refresh` yourself, then re-read (prompt the user only if you
+   cannot execute shell commands).
 2. Read every memo under `data/analyses/` (all dates, not just the latest).
 3. Read `data/retrospects/` for prior retrospect reports, so already-graded
    memos are not re-graded (each report lists the memos it covered).
@@ -28,7 +29,12 @@ A memo is gradable when it has `price_targets` and its horizon has elapsed
 (memo date + horizon ≤ today). Also gradable early: memos superseded by a
 newer memo whose delta scan declared the trigger hit or the narrative
 changed — grade those against the price at supersession, and say so.
-Exclude memos already covered by a prior retrospect.
+Additionally, memos with catalyst **checkpoints** whose dates have passed
+may be **path-graded** at those checkpoints before the horizon matures
+(did price/estimates stand roughly where the base path said they should?)
+— interim path grades accumulate calibration samples far faster than
+endpoint-only grading; mark them "interim" so they are re-graded at
+maturity. Exclude memos already fully covered by a prior retrospect.
 
 If nothing is gradable, report "nothing to grade yet — earliest memo
 matures on <date>" and stop.
@@ -42,13 +48,27 @@ For each gradable memo, one row:
   for names not in quotes.json).
 - **Tier realized**: closest of bear/base/bull to the realized price, plus
   the error vs. base as a percentage.
+- **Path (MAE/MFE)**: the within-horizon maximum adverse and maximum
+  favorable excursion vs. the memo price. Use `data/history.jsonl` for the
+  window it covers; for anything earlier, historical path data may be
+  looked up online with source and date cited (an extension of the
+  standing exception — path grading is impossible otherwise). An `enter` that ended right but drew
+  down through the entry plan's invalidation first is a worse call than
+  the endpoint says.
 - **Verdict directionally right?** Judge the `action` against what followed:
   `enter`/`hold` want the price toward base/bull; `trim`/`exit`/
   `thesis_broken` want bear-side or underperformance; `wait_for_pullback`
-  is right if a better entry printed inside the horizon; `watch_only`/
+  is right if a better entry printed inside the horizon — when the memo
+  carries an `entry_plan`, grade it concretely: did tranche 1 print? all
+  tranches? or did the price run away without ever pulling back (the
+  verdict cost the position)? `watch_only`/
   `no_edge`/`crowded_theme`/`good_company_bad_price` are graded on whether
   staying out cost little (did it beat the good-buy range logic?). One line
   of justification each — this is a judgment call, label it **[INFERENCE]**.
+- **Entry plan quality** (memos that carry one): were the tranche levels
+  touched (usable) or decoration? Did the invalidation price get hit, and
+  if so, was the forced re-analysis run — and was invalidating right, or
+  did it shake out a good position?
 - **What missed**: for wrong calls, name the dimension whose ruling was the
   culprit (e.g. `competition` ruled neutral, price war happened anyway), or
   "exogenous" if nothing in the eight dimensions could have caught it.
@@ -66,6 +86,14 @@ that, present per-memo grades only and say the sample is too small)
 - **Confidence calibration**: were `high` confidence calls actually right
   more often than `medium` and `low`? If not, confidence labels are
   decoration and the report must say so.
+- **Probability calibration** (memos with `p_bear`/`p_base`/`p_bull`):
+  compare declared tier probabilities against realized tier frequencies —
+  did tiers assigned ~55% actually land ~55% of the time? Where the sample
+  allows, score each memo Brier-style (sum over tiers of
+  (p_tier − realized)² where realized is 1 for the tier that landed, 0
+  otherwise; lower is better) and report the average. Systematic
+  overconfidence in `p_base` is the expected failure mode — say so
+  explicitly if it shows.
 - **Dimension diagnosis**: which dimension produced the most wrong rulings,
   and which divergence classifications (edge vs. blind spot) held up.
 - **User-vs-framework score**: across all graded divergences, how often was
