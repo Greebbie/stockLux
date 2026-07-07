@@ -1,4 +1,4 @@
-# StockLux
+# Luxtock
 
 Local-first equity research workbench. Not a trading bot, not a signal service —
 a disciplined pipeline for analyzing stocks against your own investment theses.
