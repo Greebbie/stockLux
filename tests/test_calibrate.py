@@ -1,5 +1,5 @@
 import json
-from datetime import date
+from datetime import date, timedelta
 
 from luxtock import calibrate
 
@@ -58,6 +58,13 @@ def write_quotes(tmp_path, prices: dict):
     (tmp_path / "quotes.json").write_text(
         json.dumps({"quotes": {t: {"price": p} for t, p in prices.items()}}),
         encoding="utf-8")
+
+
+def append_quant_history(tmp_path, rows):
+    p = tmp_path / "quant_history.jsonl"
+    with p.open("a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -387,3 +394,209 @@ def test_tracking_uses_latest_memo_per_ticker(tmp_path):
     entries = [t for t in result["tracking"] if t["ticker"] == "MULTI"]
     assert len(entries) == 1
     assert entries[0]["memo_date"] == TRACK_MEMO_DATE.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# v1.1 addition #3 -- score_calibration (join quant_history with forward
+# prices, bucket by band / composite quartile). See framework/quant.md.
+# ---------------------------------------------------------------------------
+
+SC_DATE = date(2026, 1, 1)
+SC_D30 = SC_DATE + timedelta(days=30)
+SC_D90 = SC_DATE + timedelta(days=90)
+
+
+def test_score_calibration_empty_when_no_ledger(tmp_path):
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    assert result["score_calibration"] == {
+        "n_rows": 0,
+        "windows": {
+            "30d": {"n_scored": 0, "by_band": [], "by_quartile": []},
+            "90d": {"n_scored": 0, "by_band": [], "by_quartile": []},
+        },
+    }
+    on_disk = json.loads((tmp_path / "calibration.json").read_text(encoding="utf-8"))
+    assert on_disk["score_calibration"] == result["score_calibration"]
+
+
+def test_score_calibration_skips_unparseable_and_malformed_lines(tmp_path):
+    p = tmp_path / "quant_history.jsonl"
+    p.write_text(
+        "not json at all\n"
+        + json.dumps({"ticker": "X"}) + "\n"  # missing date
+        + json.dumps({"date": "2026-01-01"}) + "\n"  # missing ticker
+        + json.dumps({
+            "date": "2026-01-01", "ticker": "OKX", "composite": 80,
+            "band": "strong", "price": 100,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    assert result["score_calibration"]["n_rows"] == 1
+
+
+def test_score_calibration_no_matchable_rows_reports_n_rows(tmp_path):
+    append_quant_history(tmp_path, [
+        {"date": SC_DATE.isoformat(), "ticker": "NOMATCH", "composite": 60,
+         "band": "fair", "price": 100},
+    ])
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    sc = result["score_calibration"]
+    assert sc["n_rows"] == 1
+    assert sc["windows"]["30d"] == {"n_scored": 0, "by_band": [], "by_quartile": []}
+    assert sc["windows"]["90d"] == {"n_scored": 0, "by_band": [], "by_quartile": []}
+
+
+def test_forward_return_matches_row_at_exact_30d_boundary(tmp_path):
+    append_quant_history(tmp_path, [
+        {"date": SC_DATE.isoformat(), "ticker": "FWD30", "composite": 75,
+         "band": "strong", "price": 100},
+    ])
+    append_history(tmp_path, [
+        {"date": (SC_DATE + timedelta(days=29)).isoformat(), "ticker": "FWD30", "price": 90},
+        {"date": SC_D30.isoformat(), "ticker": "FWD30", "price": 110},
+        {"date": (SC_DATE + timedelta(days=45)).isoformat(), "ticker": "FWD30", "price": 200},
+    ])
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    window = result["score_calibration"]["windows"]["30d"]
+    assert window["n_scored"] == 1
+    strong = next(b for b in window["by_band"] if b["band"] == "strong")
+    assert strong["n"] == 1
+    assert abs(strong["mean_return_pct"] - 10.0) < 1e-9  # (110/100-1)*100
+    assert strong["hit_rate"] == 1.0
+    # no history row >= +90d, so the 90d window has nothing to score
+    assert result["score_calibration"]["windows"]["90d"]["n_scored"] == 0
+
+
+def test_forward_return_picks_nearest_at_or_after_not_furthest(tmp_path):
+    append_quant_history(tmp_path, [
+        {"date": SC_DATE.isoformat(), "ticker": "FWD30B", "composite": 60,
+         "band": "fair", "price": 50},
+    ])
+    append_history(tmp_path, [
+        {"date": (SC_DATE + timedelta(days=31)).isoformat(), "ticker": "FWD30B", "price": 55},
+        {"date": (SC_DATE + timedelta(days=50)).isoformat(), "ticker": "FWD30B", "price": 100},
+    ])
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    window = result["score_calibration"]["windows"]["30d"]
+    fair = next(b for b in window["by_band"] if b["band"] == "fair")
+    assert abs(fair["mean_return_pct"] - 10.0) < 1e-9  # (55/50-1)*100, not the +50d row
+
+
+def test_forward_price_prefers_history_jsonl_over_quant_history_price(tmp_path):
+    append_quant_history(tmp_path, [
+        {"date": SC_DATE.isoformat(), "ticker": "BOTHX", "composite": 55,
+         "band": "fair", "price": 100},
+        {"date": (SC_DATE + timedelta(days=31)).isoformat(), "ticker": "BOTHX",
+         "composite": 58, "band": "fair", "price": 999},
+    ])
+    append_history(tmp_path, [
+        {"date": (SC_DATE + timedelta(days=31)).isoformat(), "ticker": "BOTHX", "price": 120},
+    ])
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    window = result["score_calibration"]["windows"]["30d"]
+    fair = next(b for b in window["by_band"] if b["band"] == "fair")
+    # history.jsonl (120) wins over quant_history's own price field (999)
+    assert abs(fair["mean_return_pct"] - 20.0) < 1e-9  # (120/100-1)*100
+
+
+def test_forward_price_falls_back_to_quant_history_when_no_history_jsonl(tmp_path):
+    append_quant_history(tmp_path, [
+        {"date": SC_DATE.isoformat(), "ticker": "FALLX", "composite": 55,
+         "band": "fair", "price": 50},
+        {"date": (SC_DATE + timedelta(days=31)).isoformat(), "ticker": "FALLX",
+         "composite": 58, "band": "fair", "price": 60},
+    ])
+    # no history.jsonl at all
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    window = result["score_calibration"]["windows"]["30d"]
+    fair = next(b for b in window["by_band"] if b["band"] == "fair")
+    assert fair["n"] == 1  # only the first row has a +30d target it can reach
+    assert abs(fair["mean_return_pct"] - 20.0) < 1e-9  # (60/50-1)*100
+
+
+def test_band_bucket_hand_computed_mean_and_hit_rate(tmp_path):
+    append_quant_history(tmp_path, [
+        {"date": SC_DATE.isoformat(), "ticker": "F1", "composite": 55, "band": "fair", "price": 100},
+        {"date": SC_DATE.isoformat(), "ticker": "F2", "composite": 58, "band": "fair", "price": 100},
+        {"date": SC_DATE.isoformat(), "ticker": "F3", "composite": 52, "band": "fair", "price": 100},
+    ])
+    append_history(tmp_path, [
+        {"date": SC_D30.isoformat(), "ticker": "F1", "price": 105},  # +5%
+        {"date": SC_D30.isoformat(), "ticker": "F2", "price": 97},   # -3%
+        {"date": SC_D30.isoformat(), "ticker": "F3", "price": 110},  # +10%
+    ])
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    window = result["score_calibration"]["windows"]["30d"]
+    fair = next(b for b in window["by_band"] if b["band"] == "fair")
+    assert fair["n"] == 3
+    assert abs(fair["mean_return_pct"] - 4.0) < 1e-9  # (5 - 3 + 10) / 3
+    assert abs(fair["hit_rate"] - (2 / 3)) < 1e-9
+
+
+def test_null_band_rows_excluded_from_by_band(tmp_path):
+    append_quant_history(tmp_path, [
+        {"date": SC_DATE.isoformat(), "ticker": "NULLBAND", "composite": 40,
+         "band": None, "price": 100},
+    ])
+    append_history(tmp_path, [
+        {"date": SC_D30.isoformat(), "ticker": "NULLBAND", "price": 120},
+    ])
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    window = result["score_calibration"]["windows"]["30d"]
+    assert window["n_scored"] == 1
+    assert window["by_band"] == []
+
+
+def test_quartile_bucketing_skipped_below_8_scored_rows(tmp_path):
+    quant_rows, hist_rows = [], []
+    for i in range(5):
+        t = f"Q{i}"
+        quant_rows.append({"date": SC_DATE.isoformat(), "ticker": t,
+                            "composite": 50 + i, "band": "fair", "price": 100})
+        hist_rows.append({"date": SC_D30.isoformat(), "ticker": t, "price": 105})
+    append_quant_history(tmp_path, quant_rows)
+    append_history(tmp_path, hist_rows)
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    window = result["score_calibration"]["windows"]["30d"]
+    assert window["n_scored"] == 5
+    assert window["by_quartile"] == []
+
+
+def test_quartile_bucketing_hand_computed_with_8_rows(tmp_path):
+    composites = [10, 20, 30, 40, 50, 60, 70, 80]
+    quant_rows, hist_rows = [], []
+    for i, c in enumerate(composites):
+        t = f"QT{i}"
+        quant_rows.append({"date": SC_DATE.isoformat(), "ticker": t,
+                            "composite": c, "band": "fair", "price": 100})
+        future_price = 100 + c / 10  # so forward_return_pct == c / 10
+        hist_rows.append({"date": SC_D30.isoformat(), "ticker": t, "price": future_price})
+    append_quant_history(tmp_path, quant_rows)
+    append_history(tmp_path, hist_rows)
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    window = result["score_calibration"]["windows"]["30d"]
+    assert window["n_scored"] == 8
+    quartiles = window["by_quartile"]
+    assert [q["quartile"] for q in quartiles] == ["Q1", "Q2", "Q3", "Q4"]
+    expected_means = [1.5, 3.5, 5.5, 7.5]  # mean of {1,2} {3,4} {5,6} {7,8}
+    for q, expected in zip(quartiles, expected_means):
+        assert q["n"] == 2
+        assert abs(q["mean_return_pct"] - expected) < 1e-9
+        assert q["hit_rate"] == 1.0
+
+
+def test_quartile_bucketing_excludes_rows_with_null_composite(tmp_path):
+    quant_rows, hist_rows = [], []
+    for i in range(8):
+        t = f"NC{i}"
+        composite = None if i == 0 else 10 * i  # only 7 rows have numeric composite
+        quant_rows.append({"date": SC_DATE.isoformat(), "ticker": t,
+                            "composite": composite, "band": "fair", "price": 100})
+        hist_rows.append({"date": SC_D30.isoformat(), "ticker": t, "price": 110})
+    append_quant_history(tmp_path, quant_rows)
+    append_history(tmp_path, hist_rows)
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    window = result["score_calibration"]["windows"]["30d"]
+    assert window["n_scored"] == 8  # all 8 still have a valid forward return
+    assert window["by_quartile"] == []  # but only 7 have numeric composite (<8)

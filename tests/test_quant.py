@@ -1,8 +1,13 @@
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from luxtock import quant
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def blank_features(**overrides) -> dict:
@@ -268,6 +273,62 @@ def test_components_used_sorted_when_multiple_available():
     )
     scores = quant.score_features(features)
     assert scores["components_used"] == ["momentum", "trend", "valuation"]
+
+
+# ---------------------------------------------------------------------------
+# dispersion / mixed (v1.1 addition #1)
+# ---------------------------------------------------------------------------
+
+
+def test_dispersion_none_when_zero_subscores_available():
+    scores = quant.score_features(blank_features())
+    assert scores["dispersion"] is None
+    assert scores["mixed"] is False
+
+
+def test_dispersion_none_when_only_one_subscore_available():
+    # Only valuation available (gap=-20 -> valuation=100); momentum/
+    # positioning/trend all None -> fewer than 2 available -> dispersion None.
+    scores = quant.score_features(blank_features(valuation_gap_pct=-20))
+    assert scores["valuation"] == pytest.approx(100.0)
+    assert scores["momentum"] is None
+    assert scores["dispersion"] is None
+    assert scores["mixed"] is False
+
+
+def test_dispersion_is_max_minus_min_over_available_subscores():
+    # valuation=100 (gap=-20), momentum=0 (rev=-30 -> rev_component 0,
+    # breadth missing so momentum == rev_component alone).
+    features = blank_features(valuation_gap_pct=-20, rev_90d_pct=-30)
+    scores = quant.score_features(features)
+    assert scores["valuation"] == pytest.approx(100.0)
+    assert scores["momentum"] == pytest.approx(0.0)
+    assert scores["positioning"] is None
+    assert scores["trend"] is None
+    assert scores["dispersion"] == pytest.approx(100.0)
+    assert scores["mixed"] is True
+
+
+def test_mixed_false_when_dispersion_below_40():
+    # valuation=30 (gap=15), momentum=40 (rev=0) -> dispersion 10 < 40.
+    features = blank_features(valuation_gap_pct=15, rev_90d_pct=0)
+    scores = quant.score_features(features)
+    assert scores["valuation"] == pytest.approx(30.0)
+    assert scores["momentum"] == pytest.approx(40.0)
+    assert scores["dispersion"] == pytest.approx(10.0)
+    assert scores["mixed"] is False
+
+
+def test_mixed_true_at_exactly_40_dispersion_boundary():
+    # valuation=100 (gap=-20), momentum=60 (rev=20 -> rev_component 60,
+    # breadth missing so momentum == rev_component alone) -> dispersion
+    # exactly 40, which is >= 40 -> mixed True (inclusive boundary).
+    features = blank_features(valuation_gap_pct=-20, rev_90d_pct=20)
+    scores = quant.score_features(features)
+    assert scores["valuation"] == pytest.approx(100.0)
+    assert scores["momentum"] == pytest.approx(60.0)
+    assert scores["dispersion"] == pytest.approx(40.0)
+    assert scores["mixed"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -567,3 +628,113 @@ def test_build_quant_empty_watchlist_writes_empty_tickers(tmp_path):
     result = quant.build_quant(d)
     assert result["tickers"] == {}
     assert (d / "quant.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# quant_history.jsonl (v1.1 addition #2)
+# ---------------------------------------------------------------------------
+
+
+def test_build_quant_appends_quant_history_row_per_ticker(quant_data_dir):
+    quant.build_quant(quant_data_dir)
+    path = quant_data_dir / "quant_history.jsonl"
+    assert path.exists()
+
+    lines = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    by_ticker = {row["ticker"]: row for row in lines}
+    assert set(by_ticker) == {"AAA", "BBB"}
+
+    today = _today()
+    aaa = by_ticker["AAA"]
+    assert aaa["date"] == today
+    expected_keys = {
+        "date", "ticker", "composite", "band", "valuation", "momentum",
+        "positioning", "trend", "coverage", "dispersion", "price",
+        "valuation_gap_pct", "ev_return_pct", "paired_premium_pct",
+    }
+    assert set(aaa.keys()) == expected_keys
+    assert aaa["composite"] == pytest.approx(60.2417, abs=1e-3)
+    assert aaa["band"] == "fair"
+    assert aaa["coverage"] == pytest.approx(1.0)
+    assert aaa["price"] == pytest.approx(100.0)
+    assert aaa["valuation_gap_pct"] == pytest.approx(0.0)
+    assert aaa["ev_return_pct"] == pytest.approx(10.0)
+    assert aaa["paired_premium_pct"] == pytest.approx(15.0)
+
+    bbb = by_ticker["BBB"]
+    assert bbb["date"] == today
+    assert bbb["composite"] is None
+    assert bbb["band"] is None
+    assert bbb["price"] == pytest.approx(50.0)
+
+
+def test_build_quant_same_date_rerun_replaces_rows(quant_data_dir):
+    quant.build_quant(quant_data_dir)
+    path = quant_data_dir / "quant_history.jsonl"
+
+    # Mutate the underlying quote so the second run's numbers differ.
+    quotes = json.loads((quant_data_dir / "quotes.json").read_text(encoding="utf-8"))
+    quotes["quotes"]["AAA"]["price"] = 105
+    (quant_data_dir / "quotes.json").write_text(json.dumps(quotes), encoding="utf-8")
+
+    quant.build_quant(quant_data_dir)
+    lines = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    aaa_rows = [row for row in lines if row["ticker"] == "AAA"]
+    bbb_rows = [row for row in lines if row["ticker"] == "BBB"]
+    # Same-date rerun replaces, never duplicates.
+    assert len(aaa_rows) == 1
+    assert len(bbb_rows) == 1
+    assert aaa_rows[0]["price"] == pytest.approx(105.0)
+
+
+def test_build_quant_preserves_rows_from_other_dates(quant_data_dir):
+    path = quant_data_dir / "quant_history.jsonl"
+    old_row = json.dumps({"date": "2020-01-01", "ticker": "AAA", "composite": 1.0})
+    path.write_text(old_row + "\n", encoding="utf-8")
+
+    quant.build_quant(quant_data_dir)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert old_row in lines  # untouched, byte-for-byte
+
+    today = _today()
+    parsed = [json.loads(l) for l in lines if l.strip()]
+    todays_rows = [row for row in parsed if row["date"] == today]
+    assert len(todays_rows) == 2  # AAA + BBB
+    assert len(parsed) == 3  # old row + 2 fresh rows
+
+
+def test_build_quant_preserves_unparseable_lines(quant_data_dir):
+    path = quant_data_dir / "quant_history.jsonl"
+    garbage = "{this is not valid json"
+    path.write_text(garbage + "\n", encoding="utf-8")
+
+    quant.build_quant(quant_data_dir)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert garbage in lines  # preserved, never destroyed
+
+    parsed = []
+    for line in lines:
+        if line == garbage:
+            continue
+        parsed.append(json.loads(line))
+    assert len(parsed) == 2  # AAA + BBB still appended normally
+
+
+def test_build_quant_creates_missing_quant_history_file(quant_data_dir):
+    path = quant_data_dir / "quant_history.jsonl"
+    assert not path.exists()
+
+    quant.build_quant(quant_data_dir)
+    assert path.exists()
+    lines = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 2
+
+
+def test_build_quant_writes_empty_quant_history_for_empty_watchlist(tmp_path):
+    d = tmp_path / "data"
+    d.mkdir()
+    (d / "watchlist.json").write_text(json.dumps({"stocks": []}), encoding="utf-8")
+    quant.build_quant(d)
+    path = d / "quant_history.jsonl"
+    assert path.exists()
+    assert path.read_text(encoding="utf-8") == ""

@@ -20,6 +20,13 @@ _TIERS = ("bear", "base", "bull")
 _TARGET_KEYS = ("bear", "base", "bull")
 _PROB_KEYS = ("p_bear", "p_base", "p_bull")
 
+# v1.1 addition #3 (framework/quant.md "v1.1 additions") — score calibration:
+# join data/quant_history.jsonl rows with future prices to grade "win rate by
+# setup score". Forward windows are ≥N days (nearest row at/after N days out).
+FORWARD_WINDOWS = (30, 90)
+_BANDS = ("strong", "fair", "weak")
+_MIN_QUARTILE_ROWS = 8
+
 
 def _meta_date(meta: dict) -> date | None:
     v = meta.get("date")
@@ -88,6 +95,130 @@ def _parse_iso_date(v) -> date | None:
         return date.fromisoformat(str(v))
     except (ValueError, TypeError):
         return None
+
+
+def _load_quant_history(data_dir: Path) -> list[dict]:
+    """Read data/quant_history.jsonl defensively.
+
+    Missing file -> []. Unparseable / malformed (missing date or ticker)
+    lines are skipped rather than raising. Row schema (framework/quant.md):
+    date, ticker, composite, band, valuation, momentum, positioning, trend,
+    coverage, dispersion, price, valuation_gap_pct, ev_return_pct,
+    paired_premium_pct.
+    """
+    p = Path(data_dir) / "quant_history.jsonl"
+    if not p.exists():
+        return []
+    rows = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        d = _parse_iso_date(row.get("date"))
+        ticker = row.get("ticker")
+        if d is None or not ticker:
+            continue
+        rows.append({**row, "date": d, "ticker": ticker})
+    return rows
+
+
+def _forward_price(
+    ticker: str, target_date: date,
+    history_rows: list[dict], quant_history_rows: list[dict],
+) -> float | None:
+    """Nearest price at/after target_date for ticker; history.jsonl first,
+    falling back to quant_history's own price field."""
+    for rows in (history_rows, quant_history_rows):
+        candidates = [
+            r for r in rows
+            if r["ticker"] == ticker and r["date"] >= target_date and _is_number(r.get("price"))
+        ]
+        if candidates:
+            return min(candidates, key=lambda r: r["date"])["price"]
+    return None
+
+
+def _forward_return_pct(origin_price, future_price) -> float | None:
+    if not _is_number(origin_price) or not _is_number(future_price) or origin_price == 0:
+        return None
+    return (future_price / origin_price - 1) * 100
+
+
+def _bucket_stats(returns: list[float]) -> dict:
+    n = len(returns)
+    hits = sum(1 for r in returns if r > 0)
+    return {
+        "n": n,
+        "mean_return_pct": sum(returns) / n,
+        "hit_rate": hits / n,
+    }
+
+
+def _bucket_by_band(scored: list[tuple[dict, float]]) -> list[dict]:
+    buckets: dict[str, list[float]] = {b: [] for b in _BANDS}
+    for row, ret in scored:
+        band = row.get("band")
+        if band in buckets:
+            buckets[band].append(ret)
+    return [
+        {"band": band, **_bucket_stats(rets)}
+        for band in _BANDS if (rets := buckets[band])
+    ]
+
+
+def _bucket_by_quartile(scored: list[tuple[dict, float]]) -> list[dict]:
+    valid = [(row, ret) for row, ret in scored if _is_number(row.get("composite"))]
+    if len(valid) < _MIN_QUARTILE_ROWS:
+        return []
+    valid.sort(key=lambda pair: pair[0]["composite"])
+    n = len(valid)
+    base, remainder = divmod(n, 4)
+    sizes = [base + 1 if i < remainder else base for i in range(4)]
+    buckets = []
+    idx = 0
+    for qi, size in enumerate(sizes, start=1):
+        chunk = valid[idx: idx + size]
+        idx += size
+        if not chunk:
+            continue
+        rets = [ret for _, ret in chunk]
+        buckets.append({"quartile": f"Q{qi}", **_bucket_stats(rets)})
+    return buckets
+
+
+def _window_calibration(
+    days: int, quant_history_rows: list[dict], history_rows: list[dict],
+) -> dict:
+    scored: list[tuple[dict, float]] = []
+    for row in quant_history_rows:
+        target_date = row["date"] + timedelta(days=days)
+        future_price = _forward_price(row["ticker"], target_date, history_rows, quant_history_rows)
+        ret = _forward_return_pct(row.get("price"), future_price)
+        if ret is not None:
+            scored.append((row, ret))
+    return {
+        "n_scored": len(scored),
+        "by_band": _bucket_by_band(scored),
+        "by_quartile": _bucket_by_quartile(scored),
+    }
+
+
+def _score_calibration(quant_history_rows: list[dict], history_rows: list[dict]) -> dict:
+    """framework/quant.md v1.1 addition #3. Empty-safe: 0 quant_history rows
+    yields n_rows=0 and n_scored=0 / empty buckets for every window."""
+    return {
+        "n_rows": len(quant_history_rows),
+        "windows": {
+            f"{days}d": _window_calibration(days, quant_history_rows, history_rows)
+            for days in FORWARD_WINDOWS
+        },
+    }
 
 
 def _ticker_dirs(data_dir: Path) -> list[str]:
@@ -248,7 +379,11 @@ def calibrate(data_dir: Path, as_of: date | None = None) -> dict:
 
     Writes data/calibration.json and returns the same dict. Empty-safe:
     with no matured memos, aggregate is {"n": 0, "mean_brier": None} and
-    tracking is still reported.
+    tracking is still reported. Also joins data/quant_history.jsonl (if
+    present) against forward prices to produce `score_calibration` — mean
+    forward return and hit-rate by band / composite quartile at +30d and
+    +90d (framework/quant.md v1.1 addition #3); empty-safe when the ledger
+    is absent or thin.
     """
     data_dir = Path(data_dir)
     as_of = as_of or date.today()
@@ -280,11 +415,15 @@ def calibrate(data_dir: Path, as_of: date | None = None) -> dict:
         "mean_brier": (sum(briers) / len(briers)) if briers else None,
     }
 
+    quant_history_rows = _load_quant_history(data_dir)
+    score_calibration = _score_calibration(quant_history_rows, history_rows)
+
     result = {
         "as_of": as_of.isoformat(),
         "matured": matured,
         "tracking": tracking,
         "aggregate": aggregate,
+        "score_calibration": score_calibration,
     }
     _write_calibration(data_dir, result)
     return result

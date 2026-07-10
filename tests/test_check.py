@@ -19,6 +19,13 @@ def _write_quotes(data_dir, prices: dict):
     }, ensure_ascii=False), encoding="utf-8")
 
 
+def _append_quant_history(data_dir, rows):
+    p = data_dir / "quant_history.jsonl"
+    with p.open("a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+
+
 def _entry(ticker, holding=False, layer="l", thesis="t"):
     return {"ticker": ticker, "name": ticker, "thesis": thesis, "layer": layer,
             "added": "2026-07-01", "note": "", "holding": holding}
@@ -313,3 +320,97 @@ def test_checked_at_is_iso_utc_timestamp(tmp_path):
     from datetime import datetime
     parsed = datetime.fromisoformat(result["checked_at"])
     assert parsed.tzinfo is not None
+
+
+# ---------------------------------------------------------------------------
+# v1.1 addition #4 -- band_flip alerts (framework/quant.md). Independent of
+# watchlist/memo state: driven entirely by data/quant_history.jsonl.
+# ---------------------------------------------------------------------------
+
+def test_band_flip_fires_on_change(tmp_path):
+    _append_quant_history(tmp_path, [
+        {"date": "2026-07-01", "ticker": "BF1", "composite": 55, "band": "fair"},
+        {"date": "2026-07-08", "ticker": "BF1", "composite": 75, "band": "strong"},
+    ])
+    result = check.run_checks(tmp_path)
+    flips = [a for a in result["alerts"] if a["kind"] == "band_flip"]
+    assert len(flips) == 1
+    assert flips[0]["ticker"] == "BF1"
+    assert flips[0]["level"] == "info"
+    assert "fair" in flips[0]["detail"]
+    assert "strong" in flips[0]["detail"]
+    assert "55.0" in flips[0]["detail"]
+    assert "75.0" in flips[0]["detail"]
+
+
+def test_band_flip_silent_on_same_band(tmp_path):
+    _append_quant_history(tmp_path, [
+        {"date": "2026-07-01", "ticker": "BF2", "composite": 55, "band": "fair"},
+        {"date": "2026-07-08", "ticker": "BF2", "composite": 58, "band": "fair"},
+    ])
+    result = check.run_checks(tmp_path)
+    assert [a for a in result["alerts"] if a["kind"] == "band_flip"] == []
+
+
+def test_band_flip_silent_on_single_date(tmp_path):
+    _append_quant_history(tmp_path, [
+        {"date": "2026-07-01", "ticker": "BF3", "composite": 55, "band": "fair"},
+    ])
+    result = check.run_checks(tmp_path)
+    assert [a for a in result["alerts"] if a["kind"] == "band_flip"] == []
+
+
+def test_band_flip_silent_on_null_band(tmp_path):
+    _append_quant_history(tmp_path, [
+        {"date": "2026-07-01", "ticker": "BF4", "composite": 20, "band": None},
+        {"date": "2026-07-08", "ticker": "BF4", "composite": 60, "band": "fair"},
+    ])
+    result = check.run_checks(tmp_path)
+    assert [a for a in result["alerts"] if a["kind"] == "band_flip"] == []
+
+
+def test_band_flip_uses_two_most_recent_distinct_dates_only(tmp_path):
+    _append_quant_history(tmp_path, [
+        {"date": "2026-06-01", "ticker": "BF5", "composite": 80, "band": "strong"},
+        {"date": "2026-07-01", "ticker": "BF5", "composite": 55, "band": "fair"},
+        {"date": "2026-07-08", "ticker": "BF5", "composite": 58, "band": "fair"},
+    ])
+    result = check.run_checks(tmp_path)
+    # the two most recent dates are both "fair" -- the older "strong" row
+    # (a 3rd distinct date back) must not be considered.
+    assert [a for a in result["alerts"] if a["kind"] == "band_flip"] == []
+
+
+def test_band_flip_missing_ledger_is_safe(tmp_path):
+    result = check.run_checks(tmp_path)  # no quant_history.jsonl at all
+    assert [a for a in result["alerts"] if a["kind"] == "band_flip"] == []
+
+
+def test_band_flip_malformed_lines_skipped(tmp_path):
+    p = tmp_path / "quant_history.jsonl"
+    p.write_text("not json\n" + json.dumps({"ticker": "X"}) + "\n", encoding="utf-8")
+    result = check.run_checks(tmp_path)
+    assert [a for a in result["alerts"] if a["kind"] == "band_flip"] == []
+
+
+def test_band_flip_same_date_rerun_does_not_count_as_two_dates(tmp_path):
+    # Writer contract: a same-date rerun replaces that date's row. Two rows
+    # sharing a date must collapse to one distinct date, not fire a flip.
+    _append_quant_history(tmp_path, [
+        {"date": "2026-07-01", "ticker": "BF6", "composite": 55, "band": "fair"},
+        {"date": "2026-07-01", "ticker": "BF6", "composite": 82, "band": "strong"},
+    ])
+    result = check.run_checks(tmp_path)
+    assert [a for a in result["alerts"] if a["kind"] == "band_flip"] == []
+
+
+def test_band_flip_evaluates_tickers_independently(tmp_path):
+    _append_quant_history(tmp_path, [
+        {"date": "2026-07-01", "ticker": "M1", "composite": 55, "band": "fair"},
+        {"date": "2026-07-08", "ticker": "M1", "composite": 75, "band": "strong"},
+        {"date": "2026-07-01", "ticker": "M2", "composite": 55, "band": "fair"},
+        {"date": "2026-07-08", "ticker": "M2", "composite": 58, "band": "fair"},
+    ])
+    result = check.run_checks(tmp_path)
+    flipped_tickers = {a["ticker"] for a in result["alerts"] if a["kind"] == "band_flip"}
+    assert flipped_tickers == {"M1"}

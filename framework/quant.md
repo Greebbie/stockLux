@@ -131,6 +131,29 @@ band, coverage) and writes the file.
   aggregate: {n, mean_brier}}; CLI `luxtock calibrate`. Empty-safe: with
   0 matured memos it reports n=0 and the tracking table only.
 
+## v1.1 additions (structural — no weight/knot changes)
+
+1. **Sub-score dispersion.** `score_features` also returns `dispersion`
+   (max − min over the available sub-scores, None if < 2 available) and
+   `mixed: true` when dispersion ≥ 40 — a composite built from conflicting
+   components is flagged, not averaged away silently.
+2. **Score history.** Every `luxtock quant` run appends one row per ticker
+   to `data/quant_history.jsonl`: {date (UTC), ticker, composite, band,
+   valuation, momentum, positioning, trend, coverage, dispersion, price,
+   valuation_gap_pct, ev_return_pct, paired_premium_pct}. Append-only, one
+   row per ticker per date (same-date rerun replaces that date's rows for
+   freshness). This is the dataset that will eventually validate or refute
+   the v1 weights.
+3. **Score calibration.** `luxtock calibrate` gains a `score_calibration`
+   section: joins quant_history rows with prices ≥30/≥90 days later (from
+   history.jsonl / quant_history itself) and reports mean forward return
+   and hit-rate (return > 0) bucketed by band and by composite quartile.
+   Empty-safe; fills as the ledgers deepen. **This — not assertion — is
+   where "win rate by setup score" comes from.**
+4. **Band-flip alert.** `luxtock check` compares each ticker's two most
+   recent quant_history rows and emits an info-level `band_flip` alert
+   when the band changed (e.g. fair → strong).
+
 ## Memo contract hook
 
 Memos written on/after 2026-07-12 must cite the quant snapshot (composite,

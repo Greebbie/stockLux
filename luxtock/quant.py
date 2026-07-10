@@ -16,6 +16,7 @@ from pathlib import Path
 from luxtock import store
 
 QUANT_FILE = "quant.json"
+QUANT_HISTORY_FILE = "quant_history.jsonl"
 
 # The full feature vector — order mirrors framework/quant.md's Features table.
 # `coverage` (score_features) is the fraction of these keys that are non-null.
@@ -297,6 +298,12 @@ def score_features(features: dict) -> dict:
             ("positioning", positioning), ("trend", trend),
         ) if value is not None
     )
+    available_subscores = [v for v in (valuation, momentum, positioning, trend) if v is not None]
+    dispersion = (
+        max(available_subscores) - min(available_subscores)
+        if len(available_subscores) >= 2 else None
+    )
+    mixed = dispersion is not None and dispersion >= 40
     return {
         "valuation": valuation,
         "momentum": momentum,
@@ -306,6 +313,8 @@ def score_features(features: dict) -> dict:
         "band": _band(composite, coverage, valuation),
         "coverage": coverage,
         "components_used": components_used,
+        "dispersion": dispersion,
+        "mixed": mixed,
     }
 
 
@@ -335,9 +344,64 @@ def _history_rows_for(data_dir: Path, ticker: str) -> list[dict]:
     return rows
 
 
+def _quant_history_row(today: str, ticker: str, entry: dict) -> dict:
+    """One quant_history.jsonl row for a ticker — see framework/quant.md's
+    v1.1 "Score history" addition for the schema."""
+    features, scores = entry["features"], entry["scores"]
+    return {
+        "date": today,
+        "ticker": ticker,
+        "composite": scores["composite"],
+        "band": scores["band"],
+        "valuation": scores["valuation"],
+        "momentum": scores["momentum"],
+        "positioning": scores["positioning"],
+        "trend": scores["trend"],
+        "coverage": scores["coverage"],
+        "dispersion": scores["dispersion"],
+        "price": features["price"],
+        "valuation_gap_pct": features["valuation_gap_pct"],
+        "ev_return_pct": features["ev_return_pct"],
+        "paired_premium_pct": features["paired_premium_pct"],
+    }
+
+
+def _append_quant_history(data_dir: Path, today: str, tickers: dict) -> None:
+    """Append one row per ticker to data/quant_history.jsonl. A same-date
+    rerun replaces that date's rows for freshness: existing rows are kept
+    verbatim (byte-for-byte) unless their `date` matches today, in which
+    case they are dropped before appending the fresh rows. Lines that fail
+    to parse as JSON are preserved untouched — never destroyed."""
+    path = Path(data_dir) / QUANT_HISTORY_FILE
+    kept_lines: list[str] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                kept_lines.append(line)
+                continue
+            if row.get("date") != today:
+                kept_lines.append(line)
+
+    fresh_lines = [
+        json.dumps(_quant_history_row(today, ticker, entry), ensure_ascii=False)
+        for ticker, entry in tickers.items()
+    ]
+
+    all_lines = kept_lines + fresh_lines
+    text = "\n".join(all_lines)
+    if all_lines:
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
+
+
 def build_quant(data_dir: Path) -> dict:
     """Load quotes/flows/history + the latest memo per watchlist ticker,
-    score every name, write data/quant.json and return the same dict."""
+    score every name, write data/quant.json, append a same-date-replacing
+    snapshot to data/quant_history.jsonl, and return the quant.json dict."""
     data_dir = Path(data_dir)
     watchlist = store.load_watchlist(data_dir)
     quotes = _load_json(data_dir / "quotes.json").get("quotes", {})
@@ -354,10 +418,12 @@ def build_quant(data_dir: Path) -> dict:
         )
         tickers[ticker] = {"features": features, "scores": score_features(features)}
 
+    now = datetime.now(timezone.utc)
     result = {
-        "computed_at": datetime.now(timezone.utc).isoformat(),
+        "computed_at": now.isoformat(),
         "tickers": tickers,
     }
     out_path = data_dir / QUANT_FILE
     out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    _append_quant_history(data_dir, now.date().isoformat(), tickers)
     return result

@@ -22,6 +22,11 @@ skipped, since there is nothing to check):
    methodology's trim rule.
 5. price_targets present: price at or below bear fires "through_bear"
    (warning); price at or above bull fires "at_bull_target" (info).
+6. `band_flip` (framework/quant.md v1.1 addition #4): for each ticker with
+   two or more distinct dated rows in data/quant_history.jsonl, compare its
+   two most recent distinct dates; if both carry a non-null band and the
+   band differs, fire an info-level "band_flip" alert. Reads the ledger
+   defensively -- a missing/unparseable file yields no band_flip alerts.
 
 Portfolio-level flags from `portfolio.portfolio_report` are appended last,
 mapped to the same {ticker, kind, level, detail} shape with
@@ -138,6 +143,58 @@ def _ticker_alerts(ticker: str, price: float, holding: bool, meta: dict) -> list
     return alerts
 
 
+def _load_quant_history(data_dir: Path) -> list[dict]:
+    """Read data/quant_history.jsonl defensively: missing file -> [];
+    unparseable / malformed (missing date or ticker) lines are skipped."""
+    p = Path(data_dir) / "quant_history.jsonl"
+    if not p.exists():
+        return []
+    rows = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict) or not row.get("date") or not row.get("ticker"):
+            continue
+        rows.append(row)
+    return rows
+
+
+def _fmt_composite(v) -> str:
+    return f"{v:.1f}" if isinstance(v, (int, float)) and not isinstance(v, bool) else "n/a"
+
+
+def _band_flip_alerts(data_dir: Path) -> list[dict]:
+    rows = _load_quant_history(data_dir)
+
+    by_ticker: dict[str, dict[str, dict]] = {}
+    for row in rows:
+        # last occurrence for a given (ticker, date) wins -- mirrors the
+        # writer's "same-date rerun replaces that date's rows" contract.
+        by_ticker.setdefault(row["ticker"], {})[str(row["date"])] = row
+
+    alerts: list[dict] = []
+    for ticker, by_date in by_ticker.items():
+        dates_desc = sorted(by_date, reverse=True)
+        if len(dates_desc) < 2:
+            continue
+        newest, prev = by_date[dates_desc[0]], by_date[dates_desc[1]]
+        new_band, old_band = newest.get("band"), prev.get("band")
+        if new_band is None or old_band is None or new_band == old_band:
+            continue
+        alerts.append(_alert(
+            ticker, "band_flip", "info",
+            f"{ticker} setup band {old_band} → {new_band} "
+            f"(composite {_fmt_composite(prev.get('composite'))}→"
+            f"{_fmt_composite(newest.get('composite'))})",
+        ))
+    return alerts
+
+
 def _portfolio_alerts(data_dir: Path) -> list[dict]:
     report = portfolio.portfolio_report(data_dir)
     return [
@@ -162,6 +219,7 @@ def run_checks(data_dir: Path) -> dict:
             continue
         alerts.extend(_ticker_alerts(ticker, price, bool(entry.get("holding")), memo["meta"]))
 
+    alerts.extend(_band_flip_alerts(data_dir))
     alerts.extend(_portfolio_alerts(data_dir))
 
     return {
