@@ -107,11 +107,6 @@ data/         private layer (gitignored): watchlist, memos, quant/calibration le
 output/       exported reports (gitignored)
 ```
 
-## Acknowledgements
-
-Analysis policy, quant design, and tooling built with **Claude Fable 5**
-(Anthropic) via Claude Code; module implementation by Claude Sonnet agents
-under Fable review.
 
 ## Disclaimer
 
