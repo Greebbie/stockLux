@@ -117,6 +117,18 @@ def quant() -> None:
 
 
 @app.command()
+def backfill(
+    years: int = typer.Option(2, help="how far back to fetch daily closes"),
+    days: int = typer.Option(0, help="override: only the last N days (top-up)"),
+) -> None:
+    """Backfill daily closes (yfinance) into data/history.jsonl — tickers + benchmarks."""
+    from .backfill import backfill_history
+
+    n = backfill_history(_data_dir(), years=years, days=days or None)
+    typer.echo(f"backfilled {n} rows into data/history.jsonl")
+
+
+@app.command()
 def shares(
     ticker: str,
     count: float = typer.Argument(..., help="share count (0 clears the field)"),
@@ -213,6 +225,36 @@ def calibrate() -> None:
                    f"bear→bull {row['pct_between_bear_bull']:.0f}%  "
                    f"{'above' if row['above_base'] else 'below'} base")
     typer.echo("written: data/calibration.json")
+
+
+@app.command()
+def daily() -> None:
+    """One scheduled pass: refresh → 30d backfill top-up → quant → calibrate → check.
+
+    Always exits 0 unless a step raises — alerts are printed, not signaled
+    via exit code (`luxtock check` keeps the exit-1 contract for cron use).
+    """
+    from .backfill import backfill_history
+    from .calibrate import calibrate as run_calibrate
+    from .check import run_checks
+    from .quant import build_quant
+
+    data_dir = _data_dir()
+    wl = store.load_watchlist(data_dir)
+    if not wl["stocks"]:
+        typer.echo("watchlist is empty — nothing to do")
+        raise typer.Exit(0)
+    refresh_mod.refresh_data(data_dir)
+    n_backfilled = backfill_history(data_dir, days=30)
+    build_quant(data_dir)
+    cal = run_calibrate(data_dir)
+    checks = run_checks(data_dir)
+    typer.echo(f"refreshed {len(wl['stocks'])} tickers; "
+               f"backfilled {n_backfilled} rows; "
+               f"matured {cal['aggregate']['n']}; "
+               f"alerts {len(checks['alerts'])}")
+    for a in checks["alerts"]:
+        typer.echo(f"[{a['level'].upper():<7}] {a['ticker']:<9} {a['kind']}: {a['detail']}")
 
 
 @app.command()

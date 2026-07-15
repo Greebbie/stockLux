@@ -154,6 +154,44 @@ band, coverage) and writes the file.
    recent quant_history rows and emits an info-level `band_flip` alert
    when the band changed (e.g. fair → strong).
 
+## v1.2 additions (data depth — no weight/knot changes)
+
+1. **Price backfill.** `luxtock backfill [--years N | --days N]`
+   (luxtock/backfill.py) fetches daily closes via yfinance — split-adjusted
+   but not dividend-adjusted (`auto_adjust=False`), the convention memo
+   targets are quoted in — for every watchlist ticker **and its
+   relative-strength benchmark** (default SPY), appending price-only rows
+   to data/history.jsonl marked `source: "backfill"`. Snapshot-only fields
+   (short interest, put/call, revisions, pt_mean) cannot be reconstructed
+   retroactively and stay absent. Non-destructive by construction: existing
+   (date, ticker) rows always win, and rows dated today or later are never
+   written — the refresh snapshot owns the current day. Benchmark rows are
+   inert for quant (it iterates the watchlist only) and feed calibration.
+   Backfilled watchlist-ticker rows, however, are not inert for quant:
+   once history.jsonl has a row ≤14d back, `_d14` picks it up and
+   `d14_price_pct` (and coverage) activate immediately, so composite/
+   coverage can shift on first-backfill day — that's better data, not a
+   scoring change.
+2. **Benchmark-relative score calibration.** Every `score_calibration`
+   bucket additionally reports `n_excess`, `mean_excess_return_pct` and
+   `excess_hit_rate`: the same forward returns measured against the
+   ticker's watchlist benchmark over the identical window. The absolute
+   origin price is the quant_history row's own recorded price (no
+   matching); the forward legs (stock and benchmark) use nearest-at/after
+   matching; the benchmark origin additionally requires a nearest-at/after
+   match within 7 days of the row's date, else the row falls out of the
+   excess stats (absolute fields are unaffected). Once the ledger has
+   depth, **excess** hit-rate — not absolute — is the number that
+   validates or refutes the v1 weights: a bull market must not be allowed
+   to grade the bands.
+3. **Daily pass.** `luxtock daily` = refresh → 30-day backfill top-up
+   (gap-healing; idempotent thanks to (date, ticker) dedup) → quant →
+   calibrate → check summary. Exits 0 even when alerts fire (scheduler-
+   friendly); `luxtock check` keeps its exit-1 contract for cron use.
+   scripts/register_daily_task.ps1 registers a Windows scheduled task
+   running it (default 09:00 local — after the US close for an Asia
+   timezone); the user runs the registration script manually.
+
 ## Memo contract hook
 
 Memos written on/after 2026-07-12 must cite the quant snapshot (composite,

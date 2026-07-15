@@ -156,3 +156,38 @@ def test_main_survives_gbk_stdout():
         assert gbk_out.encoding == "utf-8"
     finally:
         _sys.stdout = old_stdout
+
+
+def test_backfill_command(tmp_path, monkeypatch):
+    d = _setup_data(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "luxtock.backfill._yf_daily_closes",
+        lambda symbols, start: {s: [("2026-07-01", 100.0)] for s in symbols})
+    result = runner.invoke(app, ["backfill"])
+    assert result.exit_code == 0, result.output
+    assert "backfilled 2 rows" in result.output  # ON + its default benchmark SPY
+    hist = (d / "history.jsonl").read_text(encoding="utf-8")
+    assert '"source": "backfill"' in hist
+
+
+def test_daily_command_runs_pipeline(tmp_path, monkeypatch):
+    d = _setup_data(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("luxtock.refresh.fetch_quotes", _fake_quotes)
+    monkeypatch.setattr("luxtock.refresh.fetch_flows", _fake_flows)
+    monkeypatch.setattr("luxtock.backfill._yf_daily_closes",
+                        lambda symbols, start: {s: [] for s in symbols})
+    result = runner.invoke(app, ["daily"])
+    assert result.exit_code == 0, result.output
+    assert (d / "quotes.json").exists()
+    assert (d / "quant.json").exists()
+    assert (d / "calibration.json").exists()
+    assert "alerts" in result.output
+
+
+def test_daily_empty_watchlist_exits_0(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["daily"])
+    assert result.exit_code == 0
+    assert "watchlist is empty" in result.output

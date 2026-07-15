@@ -5,6 +5,10 @@ immature memos so the ledger is useful from day one. Pure/deterministic:
 reads memo frontmatter (via luxtock.store), data/history.jsonl and
 data/quotes.json, never mutates its inputs. See framework/quant.md
 "Module 3 — luxtock/calibrate.py" for the spec this implements.
+
+`score_calibration` also reports benchmark-relative excess-return metrics
+(n_excess, mean_excess_return_pct, excess_hit_rate) per framework/quant.md
+v1.2.
 """
 from __future__ import annotations
 
@@ -26,6 +30,14 @@ _PROB_KEYS = ("p_bear", "p_base", "p_bull")
 FORWARD_WINDOWS = (30, 90)
 _BANDS = ("strong", "fair", "weak")
 _MIN_QUARTILE_ROWS = 8
+
+# v1.2 addition #2 (framework/quant.md "v1.2 additions") — the benchmark
+# ORIGIN price must be anchored near the quant_history row's own date; a
+# benchmark whose history starts later than this tolerance would otherwise
+# get its origin nearest-at/after-matched to the same row as the forward
+# leg, silently zeroing bench_ret and inflating excess to equal the
+# absolute return.
+BENCH_ORIGIN_TOLERANCE_DAYS = 7
 
 
 def _meta_date(meta: dict) -> date | None:
@@ -128,20 +140,31 @@ def _load_quant_history(data_dir: Path) -> list[dict]:
     return rows
 
 
-def _forward_price(
+def _forward_price_dated(
     ticker: str, target_date: date,
     history_rows: list[dict], quant_history_rows: list[dict],
-) -> float | None:
-    """Nearest price at/after target_date for ticker; history.jsonl first,
-    falling back to quant_history's own price field."""
+) -> tuple[float, date] | tuple[None, None]:
+    """Nearest (price, date) at/after target_date for ticker; history.jsonl
+    first, falling back to quant_history's own price field."""
     for rows in (history_rows, quant_history_rows):
         candidates = [
             r for r in rows
             if r["ticker"] == ticker and r["date"] >= target_date and _is_number(r.get("price"))
         ]
         if candidates:
-            return min(candidates, key=lambda r: r["date"])["price"]
-    return None
+            best = min(candidates, key=lambda r: r["date"])
+            return best["price"], best["date"]
+    return None, None
+
+
+def _forward_price(
+    ticker: str, target_date: date,
+    history_rows: list[dict], quant_history_rows: list[dict],
+) -> float | None:
+    """Nearest price at/after target_date for ticker; history.jsonl first,
+    falling back to quant_history's own price field."""
+    price, _ = _forward_price_dated(ticker, target_date, history_rows, quant_history_rows)
+    return price
 
 
 def _forward_return_pct(origin_price, future_price) -> float | None:
@@ -150,33 +173,38 @@ def _forward_return_pct(origin_price, future_price) -> float | None:
     return (future_price / origin_price - 1) * 100
 
 
-def _bucket_stats(returns: list[float]) -> dict:
-    n = len(returns)
-    hits = sum(1 for r in returns if r > 0)
+def _bucket_stats(pairs: list[tuple[float, float | None]]) -> dict:
+    rets = [r for r, _ in pairs]
+    n = len(rets)
+    excesses = [e for _, e in pairs if e is not None]
+    n_x = len(excesses)
     return {
         "n": n,
-        "mean_return_pct": sum(returns) / n,
-        "hit_rate": hits / n,
+        "mean_return_pct": sum(rets) / n,
+        "hit_rate": sum(1 for r in rets if r > 0) / n,
+        "n_excess": n_x,
+        "mean_excess_return_pct": (sum(excesses) / n_x) if n_x else None,
+        "excess_hit_rate": (sum(1 for e in excesses if e > 0) / n_x) if n_x else None,
     }
 
 
-def _bucket_by_band(scored: list[tuple[dict, float]]) -> list[dict]:
-    buckets: dict[str, list[float]] = {b: [] for b in _BANDS}
-    for row, ret in scored:
+def _bucket_by_band(scored: list[tuple[dict, float, float | None]]) -> list[dict]:
+    buckets: dict[str, list[tuple[float, float | None]]] = {b: [] for b in _BANDS}
+    for row, ret, excess in scored:
         band = row.get("band")
         if band in buckets:
-            buckets[band].append(ret)
+            buckets[band].append((ret, excess))
     return [
-        {"band": band, **_bucket_stats(rets)}
-        for band in _BANDS if (rets := buckets[band])
+        {"band": band, **_bucket_stats(pairs)}
+        for band in _BANDS if (pairs := buckets[band])
     ]
 
 
-def _bucket_by_quartile(scored: list[tuple[dict, float]]) -> list[dict]:
-    valid = [(row, ret) for row, ret in scored if _is_number(row.get("composite"))]
+def _bucket_by_quartile(scored: list[tuple[dict, float, float | None]]) -> list[dict]:
+    valid = [t for t in scored if _is_number(t[0].get("composite"))]
     if len(valid) < _MIN_QUARTILE_ROWS:
         return []
-    valid.sort(key=lambda pair: pair[0]["composite"])
+    valid.sort(key=lambda t: t[0]["composite"])
     n = len(valid)
     base, remainder = divmod(n, 4)
     sizes = [base + 1 if i < remainder else base for i in range(4)]
@@ -187,21 +215,33 @@ def _bucket_by_quartile(scored: list[tuple[dict, float]]) -> list[dict]:
         idx += size
         if not chunk:
             continue
-        rets = [ret for _, ret in chunk]
-        buckets.append({"quartile": f"Q{qi}", **_bucket_stats(rets)})
+        pairs = [(ret, excess) for _, ret, excess in chunk]
+        buckets.append({"quartile": f"Q{qi}", **_bucket_stats(pairs)})
     return buckets
 
 
 def _window_calibration(
     days: int, quant_history_rows: list[dict], history_rows: list[dict],
+    benchmark_map: dict[str, str],
 ) -> dict:
-    scored: list[tuple[dict, float]] = []
+    scored: list[tuple[dict, float, float | None]] = []
     for row in quant_history_rows:
         target_date = row["date"] + timedelta(days=days)
         future_price = _forward_price(row["ticker"], target_date, history_rows, quant_history_rows)
         ret = _forward_return_pct(row.get("price"), future_price)
-        if ret is not None:
-            scored.append((row, ret))
+        if ret is None:
+            continue
+        excess = None
+        bench = benchmark_map.get(row["ticker"])
+        if bench:
+            b0, b0_date = _forward_price_dated(bench, row["date"], history_rows, quant_history_rows)
+            if b0_date is not None and (b0_date - row["date"]).days > BENCH_ORIGIN_TOLERANCE_DAYS:
+                b0 = None
+            b1 = _forward_price(bench, target_date, history_rows, quant_history_rows)
+            bench_ret = _forward_return_pct(b0, b1)
+            if bench_ret is not None:
+                excess = ret - bench_ret
+        scored.append((row, ret, excess))
     return {
         "n_scored": len(scored),
         "by_band": _bucket_by_band(scored),
@@ -209,13 +249,17 @@ def _window_calibration(
     }
 
 
-def _score_calibration(quant_history_rows: list[dict], history_rows: list[dict]) -> dict:
-    """framework/quant.md v1.1 addition #3. Empty-safe: 0 quant_history rows
-    yields n_rows=0 and n_scored=0 / empty buckets for every window."""
+def _score_calibration(
+    quant_history_rows: list[dict], history_rows: list[dict],
+    benchmark_map: dict[str, str],
+) -> dict:
+    """framework/quant.md v1.1 addition #3 + v1.2 excess-return metrics.
+    Empty-safe: 0 quant_history rows yields n_rows=0 and empty buckets."""
     return {
         "n_rows": len(quant_history_rows),
         "windows": {
-            f"{days}d": _window_calibration(days, quant_history_rows, history_rows)
+            f"{days}d": _window_calibration(
+                days, quant_history_rows, history_rows, benchmark_map)
             for days in FORWARD_WINDOWS
         },
     }
@@ -416,7 +460,12 @@ def calibrate(data_dir: Path, as_of: date | None = None) -> dict:
     }
 
     quant_history_rows = _load_quant_history(data_dir)
-    score_calibration = _score_calibration(quant_history_rows, history_rows)
+    watchlist = store.load_watchlist(data_dir)
+    benchmark_map = {
+        s["ticker"]: (s.get("benchmark") or "SPY")
+        for s in watchlist.get("stocks", []) if s.get("ticker")
+    }
+    score_calibration = _score_calibration(quant_history_rows, history_rows, benchmark_map)
 
     result = {
         "as_of": as_of.isoformat(),

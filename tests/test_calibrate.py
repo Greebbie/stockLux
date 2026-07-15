@@ -1,6 +1,8 @@
 import json
 from datetime import date, timedelta
 
+import pytest
+
 from luxtock import calibrate
 
 AS_OF = date(2025, 1, 15)  # > memo_date 2024-01-01 + 365d (2024-12-31) => matured
@@ -600,3 +602,89 @@ def test_quartile_bucketing_excludes_rows_with_null_composite(tmp_path):
     window = result["score_calibration"]["windows"]["30d"]
     assert window["n_scored"] == 8  # all 8 still have a valid forward return
     assert window["by_quartile"] == []  # but only 7 have numeric composite (<8)
+
+
+# ---------------------------------------------------------------------------
+# v1.2 -- benchmark-relative excess-return metrics (framework/quant.md).
+# `data_dir` (tests/conftest.py) seeds watchlist with ticker "ON" and no
+# explicit benchmark override, so it defaults to "SPY".
+# ---------------------------------------------------------------------------
+
+def test_score_calibration_reports_excess_vs_benchmark(data_dir):
+    append_quant_history(data_dir, [
+        {"date": "2026-01-01", "ticker": "ON", "composite": 80,
+         "band": "strong", "price": 100.0},
+    ])
+    append_history(data_dir, [
+        {"date": "2026-01-01", "ticker": "SPY", "price": 100.0},
+        {"date": "2026-01-31", "ticker": "ON", "price": 120.0},
+        {"date": "2026-01-31", "ticker": "SPY", "price": 110.0},
+    ])
+    result = calibrate.calibrate(data_dir, as_of=date(2026, 7, 1))
+    buckets = result["score_calibration"]["windows"]["30d"]["by_band"]
+    strong = next(b for b in buckets if b["band"] == "strong")
+    assert strong["mean_return_pct"] == pytest.approx(20.0)  # unchanged
+    assert strong["hit_rate"] == 1.0                          # unchanged
+    assert strong["n_excess"] == 1
+    assert strong["mean_excess_return_pct"] == pytest.approx(10.0)  # 20% - 10%
+    assert strong["excess_hit_rate"] == 1.0
+
+
+def test_score_calibration_excess_none_without_benchmark_history(data_dir):
+    append_quant_history(data_dir, [
+        {"date": "2026-01-01", "ticker": "ON", "composite": 80,
+         "band": "strong", "price": 100.0},
+    ])
+    append_history(data_dir, [
+        {"date": "2026-01-31", "ticker": "ON", "price": 120.0},
+    ])
+    result = calibrate.calibrate(data_dir, as_of=date(2026, 7, 1))
+    buckets = result["score_calibration"]["windows"]["30d"]["by_band"]
+    strong = next(b for b in buckets if b["band"] == "strong")
+    assert strong["n"] == 1                    # absolute stats unaffected
+    assert strong["n_excess"] == 0
+    assert strong["mean_excess_return_pct"] is None
+    assert strong["excess_hit_rate"] is None
+
+
+def test_score_calibration_excess_none_when_benchmark_origin_out_of_tolerance(data_dir):
+    """Benchmark's history starts after target_date (30d out) — its first
+    row would otherwise be nearest-at/after-matched as BOTH origin and
+    forward price, forcing bench_ret to 0.0 and falsely inflating excess to
+    equal the absolute return. The origin leg must be bounded to within
+    BENCH_ORIGIN_TOLERANCE_DAYS of the row's own date, or the row falls out
+    of excess stats entirely (absolute stats stay intact)."""
+    append_quant_history(data_dir, [
+        {"date": "2026-01-01", "ticker": "ON", "composite": 80,
+         "band": "strong", "price": 100.0},
+    ])
+    append_history(data_dir, [
+        {"date": "2026-01-31", "ticker": "ON", "price": 120.0},
+        {"date": "2026-02-15", "ticker": "SPY", "price": 105.0},
+    ])
+    result = calibrate.calibrate(data_dir, as_of=date(2026, 7, 1))
+    buckets = result["score_calibration"]["windows"]["30d"]["by_band"]
+    strong = next(b for b in buckets if b["band"] == "strong")
+    assert strong["n"] == 1                    # absolute stats unaffected
+    assert strong["n_excess"] == 0
+    assert strong["mean_excess_return_pct"] is None
+
+
+def test_score_calibration_excess_present_within_origin_tolerance(data_dir):
+    """A benchmark row a few days after the row's own date (but within
+    BENCH_ORIGIN_TOLERANCE_DAYS) still counts as a valid origin match."""
+    append_quant_history(data_dir, [
+        {"date": "2026-01-01", "ticker": "ON", "composite": 80,
+         "band": "strong", "price": 100.0},
+    ])
+    append_history(data_dir, [
+        {"date": "2026-01-03", "ticker": "SPY", "price": 100.0},
+        {"date": "2026-01-31", "ticker": "ON", "price": 120.0},
+        {"date": "2026-01-31", "ticker": "SPY", "price": 110.0},
+    ])
+    result = calibrate.calibrate(data_dir, as_of=date(2026, 7, 1))
+    buckets = result["score_calibration"]["windows"]["30d"]["by_band"]
+    strong = next(b for b in buckets if b["band"] == "strong")
+    assert strong["n_excess"] == 1
+    assert strong["mean_excess_return_pct"] == pytest.approx(10.0)  # 20% - 10%
+    assert strong["excess_hit_rate"] == 1.0
