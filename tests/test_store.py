@@ -422,3 +422,44 @@ def test_set_paired_preserves_top_level_keys():
     assert wl["cash_usd"] == 7100.0
     wl = store.set_paired(wl, "SKHYV", None)
     assert wl["cash_usd"] == 7100.0
+
+
+# ---------------------------------------------------------------------------
+# Atomic writes (temp file + os.replace — atomic on POSIX and Windows)
+# ---------------------------------------------------------------------------
+
+def test_write_text_atomic_writes_utf8_and_leaves_no_temp_droppings(tmp_path):
+    p = tmp_path / "out.txt"
+    store.write_text_atomic(p, "héllo — snapshot ✓")
+    assert p.read_text(encoding="utf-8") == "héllo — snapshot ✓"
+    assert [f.name for f in tmp_path.iterdir()] == ["out.txt"]
+
+
+def test_write_text_atomic_overwrites_existing_file(tmp_path):
+    p = tmp_path / "out.txt"
+    p.write_text("old", encoding="utf-8")
+    store.write_text_atomic(p, "new")
+    assert p.read_text(encoding="utf-8") == "new"
+    assert [f.name for f in tmp_path.iterdir()] == ["out.txt"]
+
+
+def test_write_json_atomic_round_trips(tmp_path):
+    p = tmp_path / "out.json"
+    data = {"a": 1, "nested": {"é": [1, 2]}, "s": "✓"}
+    store.write_json_atomic(p, data)
+    assert json.loads(p.read_text(encoding="utf-8")) == data
+    assert [f.name for f in tmp_path.iterdir()] == ["out.json"]
+
+
+def test_write_text_atomic_keeps_old_content_when_replace_fails(tmp_path, monkeypatch):
+    p = tmp_path / "out.txt"
+    p.write_text("old", encoding="utf-8")
+
+    def boom(src, dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(store.os, "replace", boom)
+    with pytest.raises(OSError):
+        store.write_text_atomic(p, "new")
+    assert p.read_text(encoding="utf-8") == "old"  # target never truncated
+    assert [f.name for f in tmp_path.iterdir()] == ["out.txt"]  # temp cleaned up

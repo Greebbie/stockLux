@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .flows import fetch_flows
 from .history import append_history
 from .quotes import fetch_quotes
-from .store import load_watchlist
+from .store import load_watchlist, write_json_atomic
+
+# Two entry points can refresh concurrently (the `luxtock ui` auto-refresh
+# thread and POST /api/refresh). They share this lock via try_refresh_data
+# so two refreshes never interleave their quotes/flows/history writes.
+_REFRESH_LOCK = threading.Lock()
 
 
 def load_json(path: Path) -> dict | None:
@@ -21,8 +27,23 @@ def load_json(path: Path) -> dict | None:
         return None
 
 
-def _write_json(path: Path, data: dict) -> None:
-    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def refresh_in_progress() -> bool:
+    """True while some thread is inside try_refresh_data."""
+    if _REFRESH_LOCK.acquire(blocking=False):
+        _REFRESH_LOCK.release()
+        return False
+    return True
+
+
+def try_refresh_data(data_dir: Path) -> dict | None:
+    """Non-blocking refresh: run refresh_data unless one is already in
+    progress, in which case skip and return None (never queue a second)."""
+    if not _REFRESH_LOCK.acquire(blocking=False):
+        return None
+    try:
+        return refresh_data(data_dir)
+    finally:
+        _REFRESH_LOCK.release()
 
 
 def refresh_data(data_dir: Path) -> dict:
@@ -34,8 +55,8 @@ def refresh_data(data_dir: Path) -> dict:
     quotes = fetch_quotes(tickers, load_json(data_dir / "quotes.json"), paired)
     flows = fetch_flows(tickers, load_json(data_dir / "flows.json"), benchmarks)
     data_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(data_dir / "quotes.json", quotes)
-    _write_json(data_dir / "flows.json", flows)
+    write_json_atomic(data_dir / "quotes.json", quotes)
+    write_json_atomic(data_dir / "flows.json", flows)
     append_history(data_dir, quotes, flows)
     return quotes
 

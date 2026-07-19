@@ -87,6 +87,16 @@ playbook below.
   `luxtock calibrate`: Brier scores for matured price targets + a
   tracking table for immature ones. Read-only for agents; the retrospect
   playbook is its consumer.
+- `data/screen.json` / `data/universe.json` — the market-wide funnel written
+  by `luxtock screen` (spec: `framework/screen.md`) and the scan universe it
+  reads. Read-only for agents: cite `screen.json` verbatim, never recompute.
+  Its rows are **candidates, not verdicts** — a name enters the desk only via
+  `luxtock add`; `rr_proxy` must always be labeled a sell-side proxy, never
+  presented as framework R/R. `track: hypergrowth` rows (no earnings base,
+  ≥30% revenue growth) carry the same 0-100 score scale but the lowest
+  confidence tier by construction — cite with that caveat. `universe.json`'s
+  optional `extra_tickers` block is the user's manually curated side list
+  for non-index listings; treat it the same as the main `tickers` list.
 
 ## CLI toolbox (works from any LLM CLI or plain shell)
 
@@ -100,6 +110,7 @@ lives in plain files under `data/`.
 | `luxtock add <T> --thesis <id>` / `hold` / `shares <T> <N>` / `cash <N>` | watchlist, holding flag, position sizing |
 | `luxtock pair <T> <HOME_TICKER> --ratio R --currency C` | pair a US listing with its home-market line (premium tracked on refresh) |
 | `luxtock quant` | feature vector + setup scores → `data/quant.json` (spec: `framework/quant.md`) |
+| `luxtock screen` | market-wide beaten-down/quality-discount/hypergrowth candidate funnel → `data/screen.json` (spec: `framework/screen.md`) |
 | `luxtock portfolio` | concentration & bear-stress report + flags |
 | `luxtock check` | price alerts vs memo levels + portfolio flags; exit 1 when any alert (cron-friendly) |
 | `luxtock calibrate` | Brier ledger for matured targets + tracking table → `data/calibration.json` |

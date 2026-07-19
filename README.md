@@ -48,13 +48,14 @@ Windows: double-click **`Luxtock.bat`** to open/start the dashboard.
 |---|---|
 | `luxtock refresh` | fetch quotes/flows (+ paired-listing premium), append history |
 | `luxtock quant` | 23-feature vector + transparent setup score per ticker → `data/quant.json` |
+| `luxtock screen` | market-wide candidate discoverer — beaten-down / quality-discount / hypergrowth funnel → `data/screen.json` (candidates only, never verdicts) |
 | `luxtock check` | price alerts vs memo levels (tranches, invalidation, trim, bear/bull); exit 1 on alert |
 | `luxtock report --pdf` | one desk-level HTML/PDF: quant table, all verdicts, alerts, calibration |
 | `luxtock export <T> --pdf` | single-name report: full memo + quant snapshot |
 | `luxtock calibrate` | Brier ledger for matured targets + tracking for immature ones |
 | `luxtock portfolio` | optional concentration & bear-stress check over sized holdings |
 | `luxtock add / hold / shares / cash / pair` | watchlist and sizing/pairing inputs |
-| `luxtock ui` | live dashboard (per-stock expandable: factors, risk/reward, full memo) |
+| `luxtock ui` | live dashboard (per-stock expandable: factors, risk/reward, full memo; Screen tab: read-only `screen.json` candidates) |
 
 Analyses run from any agent CLI:
 
@@ -112,6 +113,9 @@ output/       exported reports (gitignored)
 
 Luxtock produces analysis, not advice. **Not investment advice.** Market
 data comes from yfinance (unofficial Yahoo Finance API) with no accuracy
-guarantee; verify against official sources before trading. Setup scores
-and probabilities are uncalibrated priors until the calibration ledger has
-depth — treat them as ordinal guides, not expected returns.
+guarantee; verify against official sources before trading. When yfinance
+fails, `luxtock refresh` falls back to Cboe delayed quotes for price only
+(keyless, stdlib HTTP) — fundamentals/analyst/revisions stay marked stale
+even when the price refreshes. Setup scores and probabilities are
+uncalibrated priors until the calibration ledger has depth — treat them as
+ordinal guides, not expected returns.

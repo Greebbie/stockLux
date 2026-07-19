@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from . import store
 from .portfolio import portfolio_report
-from .refresh import load_json, refresh_data
+from .refresh import load_json, refresh_in_progress, try_refresh_data
 
 _MEMO_SUMMARY_KEYS = (
     "date", "action", "confidence", "buy_range", "multiple_basis",
@@ -203,12 +203,20 @@ def create_app(data_dir: Path) -> FastAPI:
 
     @app.post("/api/refresh")
     def trigger_refresh():
-        threading.Thread(target=refresh_data, args=(data_dir,), daemon=True).start()
+        # try_refresh_data also skips under the lock, so a racing request
+        # between this check and the thread start still refreshes only once.
+        if refresh_in_progress():
+            return {"ok": False, "message": "refresh already in progress"}
+        threading.Thread(target=try_refresh_data, args=(data_dir,), daemon=True).start()
         return {"ok": True, "message": "background refresh started"}
 
     @app.get("/api/quant")
     def quant():
         return load_json(data_dir / "quant.json") or {"computed_at": None, "tickers": {}}
+
+    @app.get("/api/screen")
+    def screen():
+        return load_json(data_dir / "screen.json") or {"computed_at": None, "results": []}
 
     @app.get("/api/portfolio")
     def portfolio():

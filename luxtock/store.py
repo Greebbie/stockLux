@@ -5,8 +5,11 @@ nothing is mutated in place.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
+import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -27,6 +30,28 @@ SIGNAL_VALUES = ["favorable", "neutral", "unfavorable", "no_signal"]
 THESIS_STATUS = ["intact", "weakening", "damaged", "dead"]
 CONFIDENCE = ["high", "medium", "low"]
 ANALYSIS_MODES = ["full", "incremental"]
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Atomic UTF-8 file write: temp file in the same directory + os.replace
+    (atomic on both POSIX and Windows). A bare write_text truncates before
+    writing, so a crash mid-write destroys the previous contents; this never
+    exposes a partially written or empty file."""
+    p = Path(path)
+    fd, tmp_name = tempfile.mkstemp(dir=p.parent, prefix=f"{p.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp_name, p)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_name)
+        raise
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    """Atomic JSON write in the repo's standard encoding (UTF-8, indent=2)."""
+    write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def ensure_dirs(data_dir: Path) -> None:

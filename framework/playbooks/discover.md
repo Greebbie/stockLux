@@ -14,7 +14,10 @@ report in English.
    companies in each layer (including smaller-cap names), at least 2–3
    candidates per layer, excluding: names too large-cap to have meaningful
    upside optionality (state the threshold), and names where thesis-relevant
-   revenue is <15% of the total.
+   revenue is <15% of the total. Also check `data/screen.json` (if fresh —
+   note its `computed_at`): a market-wide screen candidate that sits in one
+   of this thesis's layers is a pre-vetted lead; cite its score/track as
+   screening signal only (spec: `framework/screen.md`).
 3. **Quick-screen each candidate** (use quotes.json where available, otherwise
    look up online and cite the source):
    - Thesis-relevant revenue share (now → direction in 12 months)

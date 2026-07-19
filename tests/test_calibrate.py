@@ -399,6 +399,57 @@ def test_tracking_uses_latest_memo_per_ticker(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Maturity honors price_targets.horizon ("Nmo" -> round(N x 30.44) days;
+# missing/unparseable -> MATURITY_DAYS default of 365)
+# ---------------------------------------------------------------------------
+
+def test_maturity_days_parses_horizon_and_defaults():
+    assert calibrate._maturity_days({"horizon": "6mo"}) == 183   # round(6 * 30.44)
+    assert calibrate._maturity_days({"horizon": "12mo"}) == 365  # round(12 * 30.44)
+    assert calibrate._maturity_days({"horizon": "18mo"}) == 548  # round(18 * 30.44)
+    assert calibrate._maturity_days({}) == calibrate.MATURITY_DAYS
+    assert calibrate._maturity_days({"horizon": "one-year"}) == calibrate.MATURITY_DAYS
+    assert calibrate._maturity_days(None) == calibrate.MATURITY_DAYS
+
+
+def test_six_month_horizon_matures_at_183_days_not_365(tmp_path):
+    memo_date = date(2026, 1, 1)
+    write_memo(tmp_path, "SIXMO", memo_date, bear=80, base=100, bull=140,
+               horizon="6mo")
+    maturity = memo_date + timedelta(days=183)
+    append_history(tmp_path, [
+        {"date": maturity.isoformat(), "ticker": "SIXMO", "price": 95},
+    ])
+    # 200 days out: matured under the 6mo horizon, far short of 365 days
+    result = calibrate.calibrate(tmp_path, as_of=memo_date + timedelta(days=200))
+    entry = next(m for m in result["matured"] if m["ticker"] == "SIXMO")
+    assert entry["realized_price"] == 95
+    assert all(t["ticker"] != "SIXMO" for t in result["tracking"])
+
+
+def test_six_month_horizon_still_tracking_before_183_days(tmp_path):
+    memo_date = date(2026, 1, 1)
+    write_memo(tmp_path, "SIXTRACK", memo_date, bear=80, base=100, bull=140,
+               horizon="6mo")
+    write_quotes(tmp_path, {"SIXTRACK": 90.0})
+    result = calibrate.calibrate(tmp_path, as_of=memo_date + timedelta(days=100))
+    assert any(t["ticker"] == "SIXTRACK" for t in result["tracking"])
+    assert all(m["ticker"] != "SIXTRACK" for m in result["matured"])
+
+
+def test_unparseable_horizon_defaults_to_365_days(tmp_path):
+    memo_date = date(2026, 1, 1)
+    write_memo(tmp_path, "BADHOR", memo_date, bear=80, base=100, bull=140,
+               horizon="one-year")
+    write_quotes(tmp_path, {"BADHOR": 90.0})
+    # 200 days out: a shorter-horizon read would call this matured; the 365d
+    # default keeps it on the tracking table instead
+    result = calibrate.calibrate(tmp_path, as_of=memo_date + timedelta(days=200))
+    assert any(t["ticker"] == "BADHOR" for t in result["tracking"])
+    assert all(m["ticker"] != "BADHOR" for m in result["matured"])
+
+
+# ---------------------------------------------------------------------------
 # v1.1 addition #3 -- score_calibration (join quant_history with forward
 # prices, bucket by band / composite quartile). See framework/quant.md.
 # ---------------------------------------------------------------------------
@@ -515,6 +566,61 @@ def test_forward_price_falls_back_to_quant_history_when_no_history_jsonl(tmp_pat
     fair = next(b for b in window["by_band"] if b["band"] == "fair")
     assert fair["n"] == 1  # only the first row has a +30d target it can reach
     assert abs(fair["mean_return_pct"] - 20.0) < 1e-9  # (60/50-1)*100
+
+
+def test_forward_match_rejected_beyond_tolerance_bound(tmp_path):
+    """Sparse ticker: the only forward row is +200d out — far beyond both
+    targets (+30d/+90d) + FORWARD_MATCH_TOLERANCE_DAYS. Previously it was
+    silently matched, so a "+30d return" was really a +200d return."""
+    append_quant_history(tmp_path, [
+        {"date": SC_DATE.isoformat(), "ticker": "SPARSE", "composite": 60,
+         "band": "fair", "price": 100},
+    ])
+    append_history(tmp_path, [
+        {"date": (SC_DATE + timedelta(days=200)).isoformat(), "ticker": "SPARSE",
+         "price": 300},
+    ])
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    assert result["score_calibration"]["windows"]["30d"]["n_scored"] == 0
+    assert result["score_calibration"]["windows"]["90d"]["n_scored"] == 0
+
+
+def test_forward_match_accepted_within_tolerance_bound(tmp_path):
+    append_quant_history(tmp_path, [
+        {"date": SC_DATE.isoformat(), "ticker": "NEARBOUND", "composite": 60,
+         "band": "fair", "price": 100},
+    ])
+    # +40d = target (+30d) + 10d — inside the 14d forward tolerance
+    append_history(tmp_path, [
+        {"date": (SC_DATE + timedelta(days=40)).isoformat(), "ticker": "NEARBOUND",
+         "price": 110},
+    ])
+    result = calibrate.calibrate(tmp_path, as_of=AS_OF)
+    window = result["score_calibration"]["windows"]["30d"]
+    assert window["n_scored"] == 1
+    fair = next(b for b in window["by_band"] if b["band"] == "fair")
+    assert abs(fair["mean_return_pct"] - 10.0) < 1e-9
+
+
+def test_benchmark_forward_leg_beyond_bound_drops_excess_not_absolute(data_dir):
+    """The stock's forward leg matches at +30d but the benchmark's nearest
+    forward row is months later — without the bound the two legs would be
+    computed against different actual dates, corrupting excess."""
+    append_quant_history(data_dir, [
+        {"date": "2026-01-01", "ticker": "ON", "composite": 80,
+         "band": "strong", "price": 100.0},
+    ])
+    append_history(data_dir, [
+        {"date": "2026-01-01", "ticker": "SPY", "price": 100.0},
+        {"date": "2026-01-31", "ticker": "ON", "price": 120.0},
+        {"date": "2026-04-30", "ticker": "SPY", "price": 300.0},  # way past +30d+14d
+    ])
+    result = calibrate.calibrate(data_dir, as_of=date(2026, 7, 1))
+    buckets = result["score_calibration"]["windows"]["30d"]["by_band"]
+    strong = next(b for b in buckets if b["band"] == "strong")
+    assert strong["n"] == 1                    # absolute stats unaffected
+    assert strong["n_excess"] == 0
+    assert strong["mean_excess_return_pct"] is None
 
 
 def test_band_bucket_hand_computed_mean_and_hit_rate(tmp_path):

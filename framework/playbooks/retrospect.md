@@ -26,6 +26,10 @@ English.
 3. Read every memo under `data/analyses/` (all dates, not just the latest).
 4. Read `data/retrospects/` for prior retrospect reports, so already-graded
    memos are not re-graded (each report lists the memos it covered).
+5. Check `data/screen_history.jsonl` exists and note its date range (filter
+   it — grep by date/ticker; never load the whole file). It feeds step 4;
+   if it is missing or has no rows old enough, step 4 reports "no gradable
+   screen runs yet" and is skipped, not silently omitted.
 
 ## Steps
 
@@ -107,21 +111,72 @@ that, present per-memo grades only and say the sample is too small)
   there — future analyses should weight their **[INFERENCE-USER]** input on
   that dimension accordingly (and the report should say this explicitly).
 
-### 4. Propose adjustments (propose, never apply)
+### 4. Grade the screen's hit rate
+
+The screen (`framework/screen.md`) is the desk's only unfunded caller: it
+names candidates but never gets graded by `calibrate`, because
+`depression_score` is not a probability — no Brier, no tier math. This step
+grades it **informally**, the way a desk grades a junior analyst's idea
+list: did the names it liked go on to work?
+
+Source is `data/screen_history.jsonl` — one append-only line per qualified
+candidate per run (date, ticker, track, price at screen, drawdown, score,
+band). A row is gradable when its `date` is ≥90 days old — the screen's
+entry geometry is "catch the knife after it sticks", so grading younger
+rows grades noise. Skip runs already covered by a prior retrospect (each
+report lists the screen run dates it covered).
+
+For each gradable run:
+
+- **Forward return per row** since the screen date: quotes.json for names
+  now on the watchlist; `data/history.jsonl` for the window it covers;
+  anything else looked up online with source and date cited (the standing
+  exception). Always compute the same-window benchmark return (SPY) —
+  a screen that "wins" in a melt-up proves nothing.
+- **Band separation** (the core question): did `strong` rows outperform
+  `fair`, and `fair` outperform `weak`, vs. the benchmark? If bands don't
+  separate, the score's weights are decoration and the report must say so —
+  the exact standard the confidence-calibration check applies to memos.
+- **Per-track honesty**: grade `beaten_down`, `quality_discount`, and
+  `hypergrowth` separately. Hypergrowth is the declared speculative tier —
+  grade it on dispersion (a few big winners paying for blowups is that
+  track working as designed; uniform decay is not).
+- **Value-trap autopsy**: for rows that fell another ≥20% from their screen
+  price, name what they had in common (track, sector, near-missed
+  disqualifier). The cyclical-top-low-P/E trap is the documented expected
+  failure mode (`framework/screen.md`) — say explicitly whether it showed
+  up, and which flag *would* have caught it if any.
+- **Funnel conversion**: which screened names were actually added and
+  analyzed, and did the memo agree with the screen's enthusiasm? A screen
+  whose `strong` names keep drawing `watch_only`/`no_edge` memos is
+  mis-ranked even when the prices did fine — the screen's job is to feed
+  the analyze playbook, not to beat SPY on its own.
+
+Sample-size honesty mirrors the memo rule: below ~20 gradable rows (or a
+single run date), present the per-row table only and state the sample is
+too small for band-level claims.
+
+### 5. Propose adjustments (propose, never apply)
 
 If calibration shows a systematic bias, propose concrete methodology edits —
 e.g. "cyclical multiples graded 3/4 too generous; propose 8–12x → 7–10x" —
-as a short list. **Do not edit `framework/methodology.md` yourself**: the
-methodology is the user's policy; changing it requires their explicit
-sign-off.
+as a short list. The same applies to the screen: if step 4 shows bands not
+separating or a repeating trap, propose knot/weight/gate edits to
+`framework/screen.md` in the same propose-only form. **Do not edit
+`framework/methodology.md` or `framework/screen.md` yourself**: both are
+the user's policy; changing them requires their explicit sign-off.
 
 ## Output
 
 - Write `data/retrospects/<today's date, YYYY-MM-DD>.md`: the per-memo grade
   table (ticker / memo date / action / base target / realized / tier /
   right? / what missed), the calibration section, the divergence outcomes,
-  and the proposed adjustments. List the memo files covered so the next run
-  can skip them.
+  the screen hit-rate section (per-row table: ticker / screen date / band /
+  track / screen price / realized / vs SPY — plus the band-separation
+  verdict, or "no gradable screen runs yet"), and the proposed adjustments.
+  List the memo files **and screen run dates** covered so the next run can
+  skip them.
 - Report back to the user: hit rate, the single largest systematic bias
   found (or "no systematic bias detectable yet"), any divergence verdicts,
-  and the proposed methodology adjustments awaiting their sign-off.
+  whether the screen's bands separated (once gradable), and the proposed
+  methodology adjustments awaiting their sign-off.

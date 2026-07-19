@@ -1,7 +1,9 @@
 import json
+import threading
 
 from fastapi.testclient import TestClient
 
+from luxtock import refresh as refresh_mod
 from luxtock import store
 from luxtock.server import build_overview, create_app
 
@@ -296,6 +298,31 @@ def test_get_quant_endpoint_returns_file_contents(data_dir):
     assert res.json() == quant
 
 
+def test_get_screen_endpoint_missing_file_returns_empty_shape(data_dir):
+    # fixture data_dir has no screen.json — endpoint must not 500
+    res = client(data_dir).get("/api/screen")
+    assert res.status_code == 200
+    assert res.json() == {"computed_at": None, "results": []}
+
+
+def test_get_screen_endpoint_returns_file_contents(data_dir):
+    screen = {
+        "computed_at": "2026-07-10T18:52:07.837756+00:00",
+        "universe_as_of": "2026-07-01",
+        "universe_size": 500,
+        "stage_a_survivors": 42,
+        "stage_b_cap_dropped": 0,
+        "results": [{"ticker": "AAA", "track": "beaten_down", "disqualified": False,
+                     "depression_score": 61.0, "band": "fair"}],
+    }
+    (data_dir / "screen.json").write_text(json.dumps(screen), encoding="utf-8")
+    res = client(data_dir).get("/api/screen")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["computed_at"] == screen["computed_at"]
+    assert body["results"][0]["ticker"] == "AAA"
+
+
 def test_get_portfolio_endpoint_empty_when_no_holdings(data_dir):
     # fixture watchlist has no `holding: true` entries and no shares/cash_usd
     res = client(data_dir).get("/api/portfolio")
@@ -307,6 +334,32 @@ def test_get_portfolio_endpoint_empty_when_no_holdings(data_dir):
     assert body["groups"] == {"by_layer": {}, "by_thesis": {}}
     assert body["flags"] == []
     assert body["bear_stress"]["covered_tickers"] == []
+
+
+def test_refresh_endpoint_starts_background_refresh(data_dir, monkeypatch):
+    calls, done = [], threading.Event()
+
+    def fake_refresh(d):
+        calls.append(d)
+        done.set()
+
+    monkeypatch.setattr("luxtock.server.try_refresh_data", fake_refresh)
+    res = client(data_dir).post("/api/refresh")
+    assert res.status_code == 200
+    assert res.json() == {"ok": True, "message": "background refresh started"}
+    assert done.wait(timeout=5)
+    assert calls == [data_dir]
+
+
+def test_refresh_endpoint_skips_when_refresh_in_progress(data_dir):
+    # simulate a refresh mid-flight by holding the shared module-level lock
+    assert refresh_mod._REFRESH_LOCK.acquire(blocking=False)
+    try:
+        res = client(data_dir).post("/api/refresh")
+        assert res.status_code == 200
+        assert res.json() == {"ok": False, "message": "refresh already in progress"}
+    finally:
+        refresh_mod._REFRESH_LOCK.release()
 
 
 def test_get_portfolio_endpoint_with_sized_holdings(data_dir):

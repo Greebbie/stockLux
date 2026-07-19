@@ -13,12 +13,18 @@ v1.2.
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from luxtock import store
 
+# Default days-to-maturity when a memo carries no parseable
+# price_targets.horizon (the methodology keys maturity to memo date +
+# horizon; "Nmo" parses to round(N x 30.44) days).
 MATURITY_DAYS = 365
+_HORIZON_RE = re.compile(r"^\s*(\d+)\s*mo\s*$", re.IGNORECASE)
+_DAYS_PER_MONTH = 30.44
 REALIZED_MATCH_WINDOW_DAYS = 14
 _TIERS = ("bear", "base", "bull")
 _TARGET_KEYS = ("bear", "base", "bull")
@@ -38,6 +44,13 @@ _MIN_QUARTILE_ROWS = 8
 # leg, silently zeroing bench_ret and inflating excess to equal the
 # absolute return.
 BENCH_ORIGIN_TOLERANCE_DAYS = 7
+
+# Mirror of the origin tolerance for the FORWARD legs: a "+30d" return on a
+# sparse ticker would otherwise nearest-at/after-match a row hundreds of
+# days out — and the stock and benchmark legs could match *different*
+# actual dates, corrupting excess. Forward matches later than
+# target_date + this many days are rejected instead.
+FORWARD_MATCH_TOLERANCE_DAYS = 14
 
 
 def _meta_date(meta: dict) -> date | None:
@@ -70,6 +83,17 @@ def _has_bear_base_bull(pt) -> bool:
     if not isinstance(pt, dict):
         return False
     return all(_is_number(pt.get(k)) for k in _TARGET_KEYS)
+
+
+def _maturity_days(pt) -> int:
+    """Days to maturity from the memo's price_targets.horizon ("Nmo" ->
+    round(N x 30.44)); missing or unparseable falls back to MATURITY_DAYS."""
+    horizon = pt.get("horizon") if isinstance(pt, dict) else None
+    if isinstance(horizon, str):
+        m = _HORIZON_RE.match(horizon)
+        if m:
+            return round(int(m.group(1)) * _DAYS_PER_MONTH)
+    return MATURITY_DAYS
 
 
 def _load_quotes(data_dir: Path) -> dict:
@@ -144,12 +168,15 @@ def _forward_price_dated(
     ticker: str, target_date: date,
     history_rows: list[dict], quant_history_rows: list[dict],
 ) -> tuple[float, date] | tuple[None, None]:
-    """Nearest (price, date) at/after target_date for ticker; history.jsonl
-    first, falling back to quant_history's own price field."""
+    """Nearest (price, date) at/after target_date for ticker — but no later
+    than target_date + FORWARD_MATCH_TOLERANCE_DAYS; history.jsonl first,
+    falling back to quant_history's own price field."""
+    latest_ok = target_date + timedelta(days=FORWARD_MATCH_TOLERANCE_DAYS)
     for rows in (history_rows, quant_history_rows):
         candidates = [
             r for r in rows
-            if r["ticker"] == ticker and r["date"] >= target_date and _is_number(r.get("price"))
+            if r["ticker"] == ticker and target_date <= r["date"] <= latest_ok
+            and _is_number(r.get("price"))
         ]
         if candidates:
             best = min(candidates, key=lambda r: r["date"])
@@ -329,11 +356,11 @@ def _build_matured_entry(
     memo_date = _meta_date(meta)
     if memo_date is None:
         return None
-    maturity_date = memo_date + timedelta(days=MATURITY_DAYS)
+    pt = meta.get("price_targets")
+    maturity_date = memo_date + timedelta(days=_maturity_days(pt))
     if maturity_date > as_of:
         return None  # not matured yet
 
-    pt = meta.get("price_targets")
     if not _full_price_targets(pt):
         return None  # can't be graded; not "full" price targets
 
@@ -382,11 +409,11 @@ def _build_tracking_entry(ticker: str, meta: dict, as_of: date, quotes: dict) ->
     memo_date = _meta_date(meta)
     if memo_date is None:
         return None
-    maturity_date = memo_date + timedelta(days=MATURITY_DAYS)
+    pt = meta.get("price_targets")
+    maturity_date = memo_date + timedelta(days=_maturity_days(pt))
     if maturity_date <= as_of:
         return None  # already matured — belongs on the matured ledger, not tracking
 
-    pt = meta.get("price_targets")
     if not _has_bear_base_bull(pt):
         return None
 
@@ -415,7 +442,7 @@ def _build_tracking_entry(ticker: str, meta: dict, as_of: date, quotes: dict) ->
 def _write_calibration(data_dir: Path, result: dict) -> None:
     p = Path(data_dir) / "calibration.json"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    store.write_json_atomic(p, result)
 
 
 def calibrate(data_dir: Path, as_of: date | None = None) -> dict:

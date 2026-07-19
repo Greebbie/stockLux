@@ -1,7 +1,22 @@
+import json
+
 import pandas as pd
 import pytest
 
 from luxtock import quotes
+
+
+@pytest.fixture(autouse=True)
+def _block_cboe_network(monkeypatch):
+    """fetch_quotes' failure path defaults to a live Cboe fallback
+    (_cboe_price) unless a test overrides it. Block the real network call
+    by default so tests that exercise the pre-existing (non-fallback)
+    failure behavior never hit the internet; tests that want the fallback
+    stub urlopen directly or pass an explicit fallback_price_fn."""
+    def _no_network(*a, **k):
+        raise OSError("network disabled in tests")
+    monkeypatch.setattr(quotes.urllib.request, "urlopen", _no_network)
+
 
 GOOD_INFO = {
     "currentPrice": 100.0, "trailingPE": 20.0, "forwardPE": 10.0,
@@ -55,6 +70,37 @@ def test_fetch_quotes_failure_without_prev_gives_nulls(monkeypatch):
     expected_keys = set(quotes.FIELDS) | {
         "revisions", "analyst", "next_earnings", "stale", "fetched_at"}
     assert set(out["quotes"]["FAIL"]) == expected_keys
+
+
+class EmptyInfoTicker(FakeTicker):
+    """yfinance rate-limit/transient failures often return a near-empty
+    info dict WITHOUT raising — must behave exactly like an exception."""
+
+    @property
+    def info(self):
+        return {}
+
+
+def test_fetch_quotes_empty_payload_keeps_prev_and_marks_stale(monkeypatch):
+    monkeypatch.setattr(quotes.yf, "Ticker", EmptyInfoTicker)
+    prev = {"quotes": {"ON": {"price": 99.0, "ttm_pe": 18.0, "stale": False,
+                              "fetched_at": "2026-07-01T00:00:00+00:00"}}}
+    out = quotes.fetch_quotes(["ON"], prev)
+    q = out["quotes"]["ON"]
+    assert q["price"] == 99.0        # NOT overwritten with None
+    assert q["ttm_pe"] == 18.0
+    assert q["stale"] is True        # NOT a fresh-looking stale: false
+    assert q["fetched_at"] == "2026-07-01T00:00:00+00:00"  # NOT a fresh timestamp
+    expected_keys = set(quotes.FIELDS) | {
+        "revisions", "analyst", "next_earnings", "stale", "fetched_at"}
+    assert set(q) == expected_keys
+
+
+def test_fetch_quotes_empty_payload_without_prev_gives_nulls(monkeypatch):
+    monkeypatch.setattr(quotes.yf, "Ticker", EmptyInfoTicker)
+    out = quotes.fetch_quotes(["ON"])
+    assert out["quotes"]["ON"]["price"] is None
+    assert out["quotes"]["ON"]["stale"] is True
 
 
 def test_extract_revisions_maps_plus_1y_row():
@@ -265,3 +311,122 @@ def test_fetch_quotes_us_ticker_total_failure_without_prior_paired_gives_nulls(m
     assert p["ticker"] == "000660.KS"
     assert p["price"] is None
     assert p["premium_pct"] is None
+
+
+# ---------------------------------------------------------------------------
+# Cboe price-only fallback (Task 2)
+# ---------------------------------------------------------------------------
+
+
+def test_cboe_symbol_uppercases_and_maps_dash_to_dot():
+    assert quotes._cboe_symbol("AAPL") == "AAPL"
+    assert quotes._cboe_symbol("BRK-B") == "BRK.B"
+
+
+class _FakeCboeResponse:
+    """Minimal context-manager stand-in for urllib.request.urlopen's return
+    value — just enough surface (.read(), context-manager protocol) for
+    _cboe_price to consume."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _cboe_body(**data) -> bytes:
+    return json.dumps({"data": data}).encode()
+
+
+def test_cboe_price_parses_valid_json(monkeypatch):
+    monkeypatch.setattr(quotes.urllib.request, "urlopen",
+                         lambda req, timeout=None: _FakeCboeResponse(
+                             _cboe_body(current_price=151.23, close=150.0)))
+    assert quotes._cboe_price("AAPL") == pytest.approx(151.23)
+
+
+def test_cboe_price_falls_back_to_close_when_current_price_zero(monkeypatch):
+    monkeypatch.setattr(quotes.urllib.request, "urlopen",
+                         lambda req, timeout=None: _FakeCboeResponse(
+                             _cboe_body(current_price=0, close=490.91)))
+    assert quotes._cboe_price("SPX") == pytest.approx(490.91)
+
+
+def test_cboe_price_none_when_both_price_fields_missing(monkeypatch):
+    monkeypatch.setattr(quotes.urllib.request, "urlopen",
+                         lambda req, timeout=None: _FakeCboeResponse(_cboe_body()))
+    assert quotes._cboe_price("AAPL") is None
+
+
+def test_cboe_price_none_on_http_error(monkeypatch):
+    def boom(req, timeout=None):
+        raise OSError("no network")
+    monkeypatch.setattr(quotes.urllib.request, "urlopen", boom)
+    assert quotes._cboe_price("NOPE") is None
+
+
+def test_cboe_price_none_on_empty_body(monkeypatch):
+    monkeypatch.setattr(quotes.urllib.request, "urlopen",
+                         lambda req, timeout=None: _FakeCboeResponse(b""))
+    assert quotes._cboe_price("AAPL") is None
+
+
+# ---------------------------------------------------------------------------
+# fetch_quotes wired to the Cboe fallback on the failure path
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_quotes_failure_with_working_fallback_sets_price_and_source(monkeypatch):
+    monkeypatch.setattr(quotes.yf, "Ticker", FakeTicker)
+    prev = {"quotes": {"FAIL": {"price": 99.0, "ttm_pe": 18.0, "fwd_eps": 3.0, "stale": False}}}
+    out = quotes.fetch_quotes(["FAIL"], prev, fallback_price_fn=lambda t: 123.45)
+    q = out["quotes"]["FAIL"]
+    assert q["stale"] is True
+    assert q["price"] == 123.45
+    assert q["price_source"] == "cboe"
+    assert q["price_as_of"]
+    assert q["ttm_pe"] == 18.0  # fundamentals stay from prev, unaffected by the price refresh
+    assert q["fwd_eps"] == 3.0
+
+
+def test_fetch_quotes_failure_with_fallback_returning_none_matches_pre_change_behavior(monkeypatch):
+    monkeypatch.setattr(quotes.yf, "Ticker", FakeTicker)
+    prev = {"quotes": {"FAIL": {"price": 99.0, "stale": False}}}
+    out = quotes.fetch_quotes(["FAIL"], prev, fallback_price_fn=lambda t: None)
+    q = out["quotes"]["FAIL"]
+    assert q["price"] == 99.0
+    assert q["stale"] is True
+    assert "price_source" not in q
+    assert "price_as_of" not in q
+
+
+def test_fetch_quotes_failure_default_fallback_blocked_in_tests_keeps_prev_price(monkeypatch):
+    # No explicit fallback_price_fn: the module default (_cboe_price) is
+    # used, but the autouse fixture blocks its network call -> None -> same
+    # as pre-change behavior, and no real network touched.
+    monkeypatch.setattr(quotes.yf, "Ticker", FakeTicker)
+    prev = {"quotes": {"FAIL": {"price": 99.0, "stale": False}}}
+    out = quotes.fetch_quotes(["FAIL"], prev)
+    q = out["quotes"]["FAIL"]
+    assert q["price"] == 99.0
+    assert "price_source" not in q
+
+
+def test_fetch_quotes_success_after_fallback_clears_price_source(monkeypatch):
+    monkeypatch.setattr(quotes.yf, "Ticker", FakeTicker)
+    prev = {"quotes": {"ON": {"price": 90.0, "stale": True,
+                              "price_source": "cboe",
+                              "price_as_of": "2026-07-18T00:00:00+00:00"}}}
+    out = quotes.fetch_quotes(["ON"], prev)
+    q = out["quotes"]["ON"]
+    assert q["stale"] is False
+    assert q["price"] == 100.0  # fresh yfinance price, not the stale 90.0
+    assert "price_source" not in q
+    assert "price_as_of" not in q

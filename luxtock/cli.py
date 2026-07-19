@@ -117,6 +117,90 @@ def quant() -> None:
 
 
 @app.command()
+def screen(
+    top: int = typer.Option(15, help="qualified rows to print"),
+    min_drawdown: float = typer.Option(15.0, "--min-drawdown", help="Gate A drawdown floor, stored positive (%)"),
+    max_deep: int = typer.Option(100, "--max-deep", help="cap on Stage-A survivors proceeding to Stage B"),
+    universe: str = typer.Option("", "--universe", help="universe.json path override (default data/universe.json)"),
+) -> None:
+    """Candidate discoverer: market-wide beaten-down/quality-discount funnel (spec: framework/screen.md)."""
+    from .screen import (
+        NOTICE_CANDIDATES_ONLY,
+        NOTICE_RR_PROXY,
+        RR_PROXY_DISPLAY_CAP,
+        UNIVERSE_STALE_DAYS,
+        build_screen,
+        universe_age_days,
+    )
+
+    data_dir = _data_dir()
+    universe_path = Path(universe) if universe else data_dir / "universe.json"
+    try:
+        result = build_screen(data_dir, universe_path=universe_path,
+                              min_drawdown_pct=min_drawdown, max_deep=max_deep,
+                              progress_fn=typer.echo)
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1)
+
+    all_qualified = [r for r in result["results"] if not r["disqualified"]]
+    qualified = [r for r in all_qualified if r["track"] != "hypergrowth"]
+    qualified.sort(key=lambda r: (r["depression_score"] is None, -(r["depression_score"] or 0)))
+    rows = qualified[:top]
+    if not rows:
+        typer.echo("no qualified candidates")
+    for r in rows:
+        f, fu = r["features"], r["fundamentals"]
+        price = f"{f['price']:.2f}" if f.get("price") is not None else "—"
+        dd = f"{f['drawdown_pct']:.1f}%" if f.get("drawdown_pct") is not None else "—"
+        rev = f"{fu['rev_90d_pct']:+.1f}%" if fu.get("rev_90d_pct") is not None else "—"
+        fwd_pe = f"{fu['fwd_pe']:.1f}" if fu.get("fwd_pe") is not None else "—"
+        if fu.get("rr_proxy") is None:
+            rr = "—"
+        elif fu["rr_proxy"] > RR_PROXY_DISPLAY_CAP:
+            rr = ">10"
+        else:
+            rr = f"{fu['rr_proxy']:.2f}"
+        score = f"{r['depression_score']:.0f}" if r["depression_score"] is not None else "—"
+        typer.echo(f"{r['ticker']:<6} {price:>8}  dd {dd:>7}  {r['track']:<17}  "
+                   f"rev90d {rev:>7}  fwdPE {fwd_pe:>6}  rr {rr:>6}  "
+                   f"score {score:>3} [{r['band']}]  {','.join(r['flags']) or '—'}")
+
+    hypergrowth = [r for r in all_qualified if r["track"] == "hypergrowth"]
+    hypergrowth.sort(key=lambda r: (r["depression_score"] is None, -(r["depression_score"] or 0)))
+    if hypergrowth:
+        typer.echo("")
+        typer.echo("hypergrowth track — most speculative tier, no earnings anchor:")
+        for r in hypergrowth[:top]:
+            f, fu = r["features"], r["fundamentals"]
+            price = f"{f['price']:.2f}" if f.get("price") is not None else "—"
+            dd = f"{f['drawdown_pct']:.1f}%" if f.get("drawdown_pct") is not None else "—"
+            rg = f"{fu['revenue_growth'] * 100:+.0f}%" if fu.get("revenue_growth") is not None else "—"
+            ev_s = f"{fu['ev_sales']:.1f}" if fu.get("ev_sales") is not None else "—"
+            gs = f"{fu['gs_like']:.2f}" if fu.get("gs_like") is not None else "—"
+            runway = f"{fu['runway_years']:.1f}y" if fu.get("runway_years") is not None else "—"
+            score = f"{r['depression_score']:.0f}" if r["depression_score"] is not None else "—"
+            typer.echo(f"{r['ticker']:<6} {price:>8}  dd {dd:>7}  rg {rg:>6}  "
+                       f"EV/S {ev_s:>6}  gs {gs:>5}  runway {runway:>6}  "
+                       f"score {score:>3} [{r['band']}]")
+
+    if result["stage_b_cap_dropped"]:
+        typer.echo(f"note: {result['stage_b_cap_dropped']} Stage-A survivor(s) dropped by --max-deep "
+                   f"({result['stage_a_survivors']} qualified, {max_deep} proceeded to Stage B)")
+    universe_as_of = result["universe_as_of"]
+    age_days = universe_age_days(universe_as_of)
+    if age_days is not None and age_days > UNIVERSE_STALE_DAYS:
+        typer.echo(
+            f"warning: universe snapshot is {age_days} days old (as of {universe_as_of}) — "
+            "index membership has likely drifted; regenerate data/universe.json",
+            err=True,
+        )
+    typer.echo(NOTICE_CANDIDATES_ONLY)
+    typer.echo(NOTICE_RR_PROXY)
+    typer.echo("written: data/screen.json")
+
+
+@app.command()
 def backfill(
     years: int = typer.Option(2, help="how far back to fetch daily closes"),
     days: int = typer.Option(0, help="override: only the last N days (top-up)"),
@@ -177,7 +261,9 @@ def portfolio() -> None:
             typer.echo(f"  {group_kind[3:]:<8} {gname:<14} {w:.1f}%")
     bs = report["bear_stress"]
     if bs.get("drawdown_pct") is not None:
-        typer.echo(f"bear stress: {bs['drawdown_pct']:+.1f}% "
+        # drawdown_pct is a loss magnitude (positive number = loss) — label
+        # it as a drawdown rather than sign-formatting it like a return.
+        typer.echo(f"bear stress drawdown: {bs['drawdown_pct']:.1f}% "
                    f"(covered: {', '.join(bs['covered_tickers']) or '—'}"
                    f"{'; uncovered: ' + ', '.join(bs['uncovered_tickers']) if bs['uncovered_tickers'] else ''})")
     for f in report["flags"]:
@@ -306,7 +392,7 @@ def ui(
     wl = store.load_watchlist(data_dir)
     if wl["stocks"] and refresh_mod.quotes_stale(data_dir):
         typer.echo("quotes are older than 12h — refreshing in the background…")
-        threading.Thread(target=refresh_mod.refresh_data, args=(data_dir,),
+        threading.Thread(target=refresh_mod.try_refresh_data, args=(data_dir,),
                          daemon=True).start()
     from .server import create_app
 

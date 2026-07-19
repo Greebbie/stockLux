@@ -1,13 +1,26 @@
 """Deterministic quote fetcher: yfinance → quotes.json structure.
 
 Failure semantics: a failed ticker keeps its previous values with stale=True;
-with no previous record, all fields are null.
+with no previous record, all fields are null. On the failure path, price
+(only) may be refreshed from a keyless Cboe delayed-quotes fallback:
+fundamentals, analyst, and revisions data stay stale (frozen), but `price`
+can be fresher than the rest — `price_source`/`price_as_of` mark that a
+fallback fetch supplied it.
 """
 from __future__ import annotations
 
+import json
+import urllib.request
 from datetime import datetime, timezone
 
 import yfinance as yf
+
+# Keyless price-only fallback for when yfinance rate-limits/outages leave a
+# ticker's fundamentals stale — Cboe's delayed-quotes endpoint needs no API
+# key and no fundamentals, only a ~15min-delayed last price, which is fine
+# for a failure-path fallback.
+CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/{symbol}.json"
+CBOE_TIMEOUT_SECONDS = 5.0  # short: a dead fallback must not stall a refresh
 
 FIELDS = {
     "price": "currentPrice",
@@ -82,6 +95,31 @@ def extract_next_earnings(calendar) -> str | None:
     return None
 
 
+def _cboe_symbol(ticker: str) -> str:
+    """Cboe's delayed-quote symbol convention: class shares use a dot, not a
+    dash (yfinance's BRK-B -> BRK.B); plain tickers are unchanged (uppercased)."""
+    return ticker.upper().replace("-", ".")
+
+
+def _cboe_price(ticker: str) -> float | None:
+    """Keyless ~15min-delayed last price from Cboe's delayed-quotes JSON
+    endpoint. Returns None on any failure (HTTP error, missing/short body,
+    absent current_price/close, ValueError) — never raises. Runs only on the
+    primary-fetch failure path, so it must stay small and defensive."""
+    url = CBOE_URL.format(symbol=_cboe_symbol(ticker))
+    request = urllib.request.Request(url, headers={"User-Agent": "luxtock/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=CBOE_TIMEOUT_SECONDS) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        data = (json.loads(body) or {}).get("data") or {}
+        price = data.get("current_price") or data.get("close")
+        if not price:
+            return None
+        return float(price)
+    except Exception:
+        return None
+
+
 def _fetch_price(symbol: str) -> float | None:
     info = yf.Ticker(symbol).info
     price = info.get("currentPrice")
@@ -154,6 +192,12 @@ def _fetch_one(ticker: str, paired_cfg: dict | None = None, prev_paired: dict | 
     quote = {k: info.get(v) for k, v in FIELDS.items()}
     if quote["price"] is None:
         quote["price"] = info.get("regularMarketPrice")
+    if quote["price"] is None:
+        # yfinance often returns a near-empty info dict WITHOUT raising
+        # (rate limit / transient outage). A priceless quote is a failed
+        # fetch: raise so the caller's prev-value/stale fallback preserves
+        # the previous good record instead of overwriting it with nulls.
+        raise ValueError(f"empty quote payload for {ticker} (no price)")
     quote["analyst"] = {k: info.get(v) for k, v in _ANALYST_FIELDS.items()}
     try:
         quote["revisions"] = extract_revisions(t.eps_trend, t.eps_revisions)
@@ -172,10 +216,19 @@ def _fetch_one(ticker: str, paired_cfg: dict | None = None, prev_paired: dict | 
 
 def fetch_quotes(
     tickers: list[str], prev: dict | None = None, paired: dict[str, dict] | None = None,
+    *, fallback_price_fn=None,
 ) -> dict:
     """paired maps ticker -> {"ticker", "ratio", "currency"?} (from the
     watchlist's optional `paired` field) for names with a paired-listing
-    premium to track; unmapped tickers get no "paired" key at all."""
+    premium to track; unmapped tickers get no "paired" key at all.
+
+    fallback_price_fn (default `_cboe_price`) is called on the failure path
+    only, after `old` is assembled from the previous record. A returned
+    price refreshes `old["price"]` and stamps `price_source`/`price_as_of`
+    (fundamentals/analyst/revisions stay stale — only price is live); a
+    returned None reproduces the pre-fallback behavior exactly (previous
+    price kept, no price_source key)."""
+    fallback_price_fn = fallback_price_fn or _cboe_price
     prev_quotes = (prev or {}).get("quotes", {})
     paired = paired or {}
     quotes: dict = {}
@@ -195,6 +248,11 @@ def fetch_quotes(
             old["next_earnings"] = prev_q.get("next_earnings")
             old["fetched_at"] = prev_q.get("fetched_at")
             old["stale"] = True
+            fallback_price = fallback_price_fn(t)
+            if fallback_price is not None:
+                old["price"] = fallback_price
+                old["price_source"] = "cboe"
+                old["price_as_of"] = _now()
             if paired_cfg:
                 prev_paired = prev_q.get("paired")
                 old["paired"] = prev_paired if isinstance(prev_paired, dict) else _null_paired(paired_cfg)

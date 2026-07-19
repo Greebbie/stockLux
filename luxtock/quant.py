@@ -18,6 +18,13 @@ from luxtock import store
 QUANT_FILE = "quant.json"
 QUANT_HISTORY_FILE = "quant_history.jsonl"
 
+# A "d14" delta only deserves the name when the two rows are roughly two
+# weeks apart: under the floor there is too little separation to call it a
+# delta at all; over the ceiling a sparse history would silently relabel a
+# month-plus move as a two-week one.
+D14_MIN_GAP_DAYS = 7
+D14_MAX_GAP_DAYS = 21
+
 # The full feature vector — order mirrors framework/quant.md's Features table.
 # `coverage` (score_features) is the fraction of these keys that are non-null.
 FEATURE_KEYS: tuple[str, ...] = (
@@ -95,8 +102,9 @@ def _d14(history_rows: list[dict], ticker: str) -> tuple[float | None, float | N
     """Deltas vs. the history row closest to 14 days before the latest row.
 
     None (all three) if fewer than 2 rows exist for this ticker, or if the
-    row closest to 14 days before the latest one is itself < 7 days away
-    from it (too little separation to call it a "d14" delta).
+    row closest to 14 days before the latest one is itself outside the
+    [D14_MIN_GAP_DAYS, D14_MAX_GAP_DAYS] window (too little separation to
+    call it a "d14" delta, or so much that it isn't one).
     """
     rows = sorted(
         (r for r in history_rows if r.get("ticker") == ticker and r.get("date")),
@@ -111,7 +119,7 @@ def _d14(history_rows: list[dict], ticker: str) -> tuple[float | None, float | N
         key=lambda r: abs((latest_date - date.fromisoformat(r["date"])).days - 14),
     )
     gap_days = (latest_date - date.fromisoformat(best["date"])).days
-    if gap_days < 7:
+    if gap_days < D14_MIN_GAP_DAYS or gap_days > D14_MAX_GAP_DAYS:
         return None, None, None
 
     d_price = _ratio_pct(latest.get("price"), best.get("price"))
@@ -395,7 +403,7 @@ def _append_quant_history(data_dir: Path, today: str, tickers: dict) -> None:
     text = "\n".join(all_lines)
     if all_lines:
         text += "\n"
-    path.write_text(text, encoding="utf-8")
+    store.write_text_atomic(path, text)
 
 
 def build_quant(data_dir: Path) -> dict:
@@ -424,6 +432,6 @@ def build_quant(data_dir: Path) -> dict:
         "tickers": tickers,
     }
     out_path = data_dir / QUANT_FILE
-    out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    store.write_json_atomic(out_path, result)
     _append_quant_history(data_dir, now.date().isoformat(), tickers)
     return result

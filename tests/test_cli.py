@@ -158,6 +158,27 @@ def test_main_survives_gbk_stdout():
         _sys.stdout = old_stdout
 
 
+def test_portfolio_prints_bear_stress_as_unsigned_drawdown(tmp_path, monkeypatch):
+    # drawdown_pct is a loss magnitude — a 19% loss must never print "+19.0%"
+    d = _setup_data(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    wl = store.set_shares(store.set_holding(store.load_watchlist(d), "ON", True), "ON", 10)
+    store.save_watchlist(d, wl)
+    (d / "quotes.json").write_text(json.dumps({
+        "fetched_at": "2026-07-19T00:00:00+00:00",
+        "quotes": {"ON": {"price": 100.0}}}), encoding="utf-8")
+    memo_dir = d / "analyses" / "ON"
+    memo_dir.mkdir(parents=True, exist_ok=True)
+    (memo_dir / "2026-07-08.md").write_text(
+        '---\nticker: "ON"\ndate: 2026-07-08\n'
+        "price_targets:\n  bear: 81\n  base: 120\n  bull: 150\n---\nbody\n",
+        encoding="utf-8")
+    result = runner.invoke(app, ["portfolio"])
+    assert result.exit_code == 0, result.output
+    assert "bear stress drawdown: 19.0%" in result.output
+    assert "+19.0%" not in result.output
+
+
 def test_backfill_command(tmp_path, monkeypatch):
     d = _setup_data(tmp_path)
     monkeypatch.chdir(tmp_path)

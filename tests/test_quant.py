@@ -448,6 +448,29 @@ def test_d14_none_when_closest_row_is_under_7_days_away():
     assert features["d14_rsi"] is None
 
 
+def test_d14_none_when_closest_row_is_beyond_21_day_ceiling():
+    # Sparse history: the only candidate row is 30 days back — beyond
+    # D14_MAX_GAP_DAYS, so calling the month-plus move a "d14" delta would
+    # silently overstate the two-week change.
+    rows = [
+        {"date": "2026-05-26", "ticker": "T", "price": 100, "short_pct_float": 0.05, "rsi_14": 40},
+        {"date": "2026-06-25", "ticker": "T", "price": 130, "short_pct_float": 0.07, "rsi_14": 60},
+    ]
+    features = quant.compute_features("T", {"price": 130}, None, None, rows)
+    assert features["d14_price_pct"] is None
+    assert features["d14_short_pct_float"] is None
+    assert features["d14_rsi"] is None
+
+
+def test_d14_accepted_at_exact_21_day_ceiling():
+    rows = [
+        {"date": "2026-06-04", "ticker": "T", "price": 100},
+        {"date": "2026-06-25", "ticker": "T", "price": 110},
+    ]
+    features = quant.compute_features("T", {"price": 110}, None, None, rows)
+    assert features["d14_price_pct"] == pytest.approx(10.0)
+
+
 def test_d14_ignores_row_without_ticker_key():
     # Public-API robustness: compute_features can be called with mixed-ticker
     # row lists. A row with no "ticker" key at all must NOT be treated as

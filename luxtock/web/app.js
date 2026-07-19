@@ -6,6 +6,14 @@ const SIG_LABEL = { chain: "chain", narrative: "narrative", fundamentals: "funda
                     valuation: "valuation", flows: "flows", sentiment: "sentiment",
                     competition: "competition", macro: "macro" };
 
+// pt_low near spot makes rr_proxy explode; cap the *display* only — same
+// rule as luxtock/screen.py's RR_PROXY_DISPLAY_CAP (screen.json stays honest).
+const RR_PROXY_DISPLAY_CAP = 10;
+
+// mirror of luxtock/screen.py's UNIVERSE_STALE_DAYS — index membership
+// drifts ad hoc; a snapshot older than a quarter has likely diverged.
+const UNIVERSE_STALE_DAYS = 90;
+
 async function api(path, opts = {}) {
   const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
   if (!res.ok) throw new Error(await res.text());
@@ -52,6 +60,30 @@ function setupCell(quant, ticker) {
   const cls = { strong: "chip-strong", fair: "chip-fair", weak: "chip-weak" }[band] || "chip-na";
   const coverage = s.coverage != null ? `coverage ${Math.round(s.coverage * 100)}%` : "coverage —";
   return `<span class="chip ${cls}" title="${esc(coverage)}">${Math.round(s.composite)} <span class="muted">${esc(band)}</span></span>`;
+}
+
+function screenScoreChip(r) {
+  if (r.depression_score == null) return '<span class="muted">—</span>';
+  const band = r.band || "n/a";
+  const cls = { strong: "chip-strong", fair: "chip-fair", weak: "chip-weak" }[band] || "chip-na";
+  const coverage = r.coverage != null ? `coverage ${Math.round(r.coverage * 100)}%` : "coverage —";
+  return `<span class="chip ${cls}" title="${esc(coverage)}">${Math.round(r.depression_score)} <span class="muted">${esc(band)}</span></span>`;
+}
+
+function screenRrCell(rr) {
+  if (rr == null) return "—";
+  return rr > RR_PROXY_DISPLAY_CAP ? ">10" : fmt(rr, 2);
+}
+
+function screenTickerCell(ticker) {
+  const cmd = `luxtock add ${ticker}`;
+  return `<span class="ticker">${esc(ticker)}</span>
+    <button class="ghost" data-c="${esc(cmd)}" onclick="navigator.clipboard.writeText(this.dataset.c).then(()=>toast('Copied'))">⧉ add</button>`;
+}
+
+function screenFetchFailedBadge(r) {
+  return r.fetch_failed
+    ? ` <span class="badge warn" title="${esc(r.fetch_failed)}">fetch failed</span>` : "";
 }
 
 const QUANT_FACTOR_GROUPS = [
@@ -353,7 +385,9 @@ async function renderOverview() {
         <td><span class="ticker" onclick="event.stopPropagation(); showStock('${r.ticker}')">${r.ticker}</span>${r.holding ? ' <span class="badge ok" title="user holds a position — hold/trim/exit verdicts apply">held</span>' : ""}
             <div class="muted">${esc(r.name)}</div></td>
         <td class="muted">${esc(r.layer)}</td>
-        <td>${fmt(q.price, 2)}${q.stale ? ' <span class="badge warn">stale</span>' : ""}</td>
+        <td>${fmt(q.price, 2)}${q.stale ? (q.price_source
+          ? ' <span class="badge warn" title="fundamentals stale — price via Cboe fallback">stale</span>'
+          : ' <span class="badge warn">stale</span>') : ""}</td>
         <td>${range}</td>
         <td>${targetCell(m, q.price)}</td>
         <td>${verdictBadge(m)}${err}</td>
@@ -369,6 +403,97 @@ async function renderOverview() {
   html += `<h2>Analysis commands</h2><p class="muted">Copy into any agent CLI (Claude Code / Codex / Gemini …)</p>`;
   html += cmdBlock(`claude "Read framework/playbooks/scan.md and sweep the whole watchlist"`);
   $("#view").innerHTML = html || "<p class='muted'>Watchlist is empty — add stocks under Manage.</p>";
+}
+
+function screenSortByScoreDesc(a, b) {
+  // nulls last, same as the CLI's `(score is None, -score)` sort key
+  if (a.depression_score == null) return b.depression_score == null ? 0 : 1;
+  if (b.depression_score == null) return -1;
+  return b.depression_score - a.depression_score;
+}
+
+async function renderScreen() {
+  const s = await api("/api/screen");
+  if (!s.computed_at) {
+    $("#view").innerHTML = `<p class="muted">no screen run yet</p>${cmdBlock("luxtock screen")}`;
+    return;
+  }
+  const results = s.results || [];
+  const qualified = results.filter((r) => !r.disqualified);
+  const disqualified = results.filter((r) => r.disqualified);
+  const standard = qualified.filter((r) => r.track !== "hypergrowth").sort(screenSortByScoreDesc);
+  const hypergrowth = qualified.filter((r) => r.track === "hypergrowth").sort(screenSortByScoreDesc);
+
+  const universeAgeDays = (Date.now() - Date.parse(s.universe_as_of)) / 86400000;
+  const universeStaleBadge = Number.isFinite(universeAgeDays) && universeAgeDays > UNIVERSE_STALE_DAYS
+    ? ` <span class="badge warn" title="index membership has likely drifted — regenerate data/universe.json">universe stale</span>`
+    : "";
+
+  let html = `<div class="muted">screened ${esc(new Date(s.computed_at).toLocaleString())}
+    · universe ${s.universe_size} tickers (as of ${esc(s.universe_as_of)})
+    · ${s.stage_a_survivors} passed stage A${universeStaleBadge}</div>`;
+
+  html += `<table><tr><th>Ticker</th><th>Price</th><th>Drawdown</th><th>Track</th>
+    <th>Rev 90d</th><th>Fwd P/E</th><th>R/R proxy</th><th>Score</th></tr>`;
+  for (const r of standard) {
+    const f = r.features || {}, fu = r.fundamentals || {};
+    html += `<tr>
+      <td>${screenTickerCell(r.ticker)}${screenFetchFailedBadge(r)}</td>
+      <td>${fmt(f.price, 2)}</td>
+      <td>${fmt(f.drawdown_pct, 1)}%</td>
+      <td class="muted">${esc(pretty(r.track))}</td>
+      <td>${fu.rev_90d_pct != null ? sgn(fu.rev_90d_pct, 1) + "%" : "—"}</td>
+      <td>${fmt(fu.fwd_pe, 1)}</td>
+      <td>${screenRrCell(fu.rr_proxy)}</td>
+      <td>${screenScoreChip(r)}</td>
+    </tr>`;
+  }
+  html += standard.length ? "</table>" : `</table><p class="muted">no qualified candidates</p>`;
+
+  if (hypergrowth.length) {
+    html += `<h3>hypergrowth track — most speculative tier, no earnings anchor:</h3>`;
+    html += `<table><tr><th>Ticker</th><th>Price</th><th>Drawdown</th><th>Rev growth</th>
+      <th>EV/S</th><th>GS</th><th>Runway</th><th>Score</th></tr>`;
+    for (const r of hypergrowth) {
+      const f = r.features || {}, fu = r.fundamentals || {};
+      const revGrowth = fu.revenue_growth != null ? `${sgn(fu.revenue_growth * 100, 0)}%` : "—";
+      const runway = fu.runway_years != null ? `${fmt(fu.runway_years, 1)}y` : "—";
+      html += `<tr>
+        <td>${screenTickerCell(r.ticker)}${screenFetchFailedBadge(r)}</td>
+        <td>${fmt(f.price, 2)}</td>
+        <td>${fmt(f.drawdown_pct, 1)}%</td>
+        <td>${revGrowth}</td>
+        <td>${fmt(fu.ev_sales, 1)}</td>
+        <td>${fmt(fu.gs_like, 2)}</td>
+        <td>${runway}</td>
+        <td>${screenScoreChip(r)}</td>
+      </tr>`;
+    }
+    html += "</table>";
+  }
+
+  if (disqualified.length) {
+    html += `<details class="panel"><summary>${disqualified.length} disqualified</summary>
+      <table><tr><th>Ticker</th><th>Price</th><th>Drawdown</th><th>Flags</th><th>Score</th></tr>`;
+    for (const r of disqualified) {
+      const f = r.features || {};
+      const flags = (r.flags || []).map((fl) => `<span class="tag-risk">${esc(pretty(fl))}</span>`).join(" ")
+        || '<span class="muted">—</span>';
+      html += `<tr>
+        <td>${esc(r.ticker)}${screenFetchFailedBadge(r)}</td>
+        <td>${fmt(f.price, 2)}</td>
+        <td>${fmt(f.drawdown_pct, 1)}%</td>
+        <td>${flags}</td>
+        <td>${screenScoreChip(r)}</td>
+      </tr>`;
+    }
+    html += "</table></details>";
+  }
+
+  html += `<div class="muted" style="margin-top:12px">candidates only — not analyzed, no verdicts</div>
+    <div class="muted">rr_proxy is sell-side-derived, screening signal only</div>`;
+
+  $("#view").innerHTML = html;
 }
 
 async function showStock(ticker) {
@@ -493,6 +618,7 @@ function render() {
   document.querySelectorAll("nav button").forEach((b) =>
     b.classList.toggle("active", b.dataset.view === state.view));
   if (state.view === "overview") renderOverview();
+  else if (state.view === "screen") renderScreen();
   else if (state.view === "theses") renderTheses();
   else if (state.view === "manage") renderManage();
   else if (state.view === "stock") showStock(state.ticker);
